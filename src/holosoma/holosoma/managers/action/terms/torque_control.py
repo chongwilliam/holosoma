@@ -29,7 +29,7 @@ wbc_server_dict = {
     "DESIRED_LEFT_HAND_POSITION": "wbc::left_hand::pos",
     "DESIRED_LEFT_HAND_ORIENTATION": "wbc::left_hand::ori",
     "DESIRED_LEFT_FOOT_POSITION": "wbc::left_foot::pos",
-    "DESIRED_LEFT_FOOT_ORIENTATION": "wbc::left_foot::ori",
+    "DESIRED_LEFT_FOOT_ORIENTATION": "wbc::left_foot::ori",   
 
     # contact state (contact point, contact angular basis)
     "RIGHT_FOOT_CONTACT_POINT": "wbc::right_foot::contact_point",
@@ -218,10 +218,8 @@ class JointTorqueActionTerm(ActionTermBase):
         # Get information to send to whole-body control server
         robot_q = self.env.simulator.dof_pos 
         robot_dq = self.env.simulator.dof_vel
-        contact_state = self.env.simulator.contact_state  # list of contact states (contact point [Vector3d], angular basis [Matrix3d])
-
-        # Compose actions
-
+        contact_position = self.env.simulator.contact_position
+        
         self.redis_client.set(wbc_server_dict["ROBOT_JOINT_ANGLE"], tensor_to_string(robot_q))
         self.redis_client.set(wbc_server_dict["ROBOT_JOINT_VEL"], tensor_to_string(robot_dq))
 
