@@ -786,6 +786,15 @@ class IsaacSim(BaseSimulator):
             :, :effective_history_length, self._contact_to_robot_body_ids
         ]  # (num_envs, history_length, num_bodies, 3), the first index is the most recent
 
+        # Added: contact positions, rotated to foot frame
+        self.contact_positions = self.contact_sensor.data.contact_pos_w[
+            :, self._contact_to_robot_body_ids
+        ]  # (num_envs, num_bodies, 3) in world frame (NAN if not in contact)
+        
+        for body_name in self.body_names:
+            if 'ankle' in body_name:
+                # get orientation, and report contact position in link frame
+
         self._rigid_body_pos = self._robot.data.body_pos_w[:, self.body_ids, :]
         self._rigid_body_rot = self._robot.data.body_quat_w[:, self.body_ids][
             :, :, [1, 2, 3, 0]
@@ -796,7 +805,7 @@ class IsaacSim(BaseSimulator):
     def clear_contact_forces_history(self, env_id):
         if len(env_id) > 0:
             self.contact_forces_history[env_id, :, :, :] = 0.0
-
+            
     def apply_torques_at_dof(self, torques):
         self._robot.set_joint_effort_target(torques, joint_ids=self.dof_ids)
 
