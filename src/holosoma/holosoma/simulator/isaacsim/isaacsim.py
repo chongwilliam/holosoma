@@ -59,7 +59,6 @@ from holosoma.simulator.shared.virtual_gantry import (
 
 from holosoma.simulator.types import ActorNames, ActorIndices, EnvIds, ActorStates, ActorPoses
 
-
 class IsaacSim(BaseSimulator):
     def __init__(self, tyro_config: FullSimConfig, terrain_manager: TerrainManager, device: str):
         super().__init__(tyro_config, terrain_manager, device)
@@ -228,6 +227,8 @@ class IsaacSim(BaseSimulator):
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             usd_conversion_dir = os.path.abspath(os.path.join(asset_root, f"converted_rank{local_rank}"))
 
+            # import ipdb; ipdb.set_trace()
+
             spawn = sim_utils.UrdfFileCfg(
                 usd_dir=usd_conversion_dir,
                 asset_path=full_urdf_path,
@@ -314,6 +315,8 @@ class IsaacSim(BaseSimulator):
             track_air_time=True,
             force_threshold=10.0,
             debug_vis=True,
+            track_contact_points=True, # added
+            filter_prim_paths_expr=["/World/ground"], # added, due to track_contact_points=True
         )
 
         terrain_prim_path = "/World/ground"
@@ -609,6 +612,8 @@ class IsaacSim(BaseSimulator):
         #     ),
         # ),
 
+        # import ipdb; ipdb.set_trace()
+
         self.dof_ids, self.dof_names = self._robot.find_joints(dof_names_list, preserve_order=True)
         self.body_ids, self.body_names = self._robot.find_bodies(self.robot_config.body_names, preserve_order=True)
 
@@ -795,10 +800,14 @@ class IsaacSim(BaseSimulator):
         self.contact_positions = self.contact_sensor.data.contact_pos_w[
             :, self._contact_to_robot_body_ids
         ]  # (num_envs, num_bodies, 3) in world frame (NAN if not in contact)
+
+        print(self.contact_positions)
         
         for body_name in self.body_names:
             if 'ankle' in body_name:
-                # get orientation, and report contact position in link frame
+                # get orientation, and report contact position in link frame                
+                ankle_rot = self._robot.data.body_quat_w[:, self.body_names.index(body_name)][:, [1, 2, 3, 0]]
+                print(ankle_rot)
 
         self._rigid_body_pos = self._robot.data.body_pos_w[:, self.body_ids, :]
         self._rigid_body_rot = self._robot.data.body_quat_w[:, self.body_ids][

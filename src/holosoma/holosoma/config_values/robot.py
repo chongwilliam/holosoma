@@ -528,7 +528,8 @@ g1_29dof = RobotConfig(
     ),
     asset=RobotAssetConfig(
         asset_root="@holosoma/data/robots",
-        collapse_fixed_joints=True,
+        # collapse_fixed_joints=True,
+        collapse_fixed_joints=False,  # contact_point fix
         replace_cylinder_with_capsule=True,
         flip_visual_attachments=False,
         armature=0.001,

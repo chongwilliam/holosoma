@@ -113,7 +113,7 @@ class BaseSimulator:
     dof_pos: torch.Tensor
     dof_vel: torch.Tensor
     # contact_state: torch.Tensor  # added for feet contact state
-    contact_positions: torch.Tensor # added for feet contact state 
+    # contact_positions: torch.Tensor # added for feet contact state 
     contact_forces: torch.Tensor
     contact_forces_history: torch.Tensor
     scene: SceneInterface
