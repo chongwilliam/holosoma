@@ -21,6 +21,8 @@ g1_29dof = RobotConfig(
     foot_height_name="foot_contact_point",
     knee_name="knee_link",
     torso_name="torso_link",
+    foot_center=[0.039, 0, -0.025], # added: from center of cylinder collision
+    foot_dimension=[0.186, 0.142], # added: [length, width] measured from urdf collision
     dof_names=[
         "left_hip_pitch_joint",
         "left_hip_roll_joint",
@@ -529,7 +531,7 @@ g1_29dof = RobotConfig(
     asset=RobotAssetConfig(
         asset_root="@holosoma/data/robots",
         # collapse_fixed_joints=True,
-        collapse_fixed_joints=False,  # contact_point fix
+        collapse_fixed_joints=False,  # contact_point fix for IsaacSim
         replace_cylinder_with_capsule=True,
         flip_visual_attachments=False,
         armature=0.001,

@@ -220,6 +220,15 @@ class JointTorqueActionTerm(ActionTermBase):
         robot_dq = self.env.simulator.dof_vel
         contact_position = self.env.simulator.contact_position
         
+        for body_name in self.body_names:
+            if 'ankle' in body_name:
+                # Get orientation, and report contact position in link frame                
+                ankle_rot = self._robot.data.body_quat_w[:, self.body_names.index(body_name)][:, [1, 2, 3, 0]]
+                print(ankle_rot)
+                
+                # Convert contact point from world to body frame (dict)
+                self.feet_contact_positions[body_name] = quat_apply(ankle_rot, self.contact_positions[:, self._contact_to_robot_body_ids])
+        
         self.redis_client.set(wbc_server_dict["ROBOT_JOINT_ANGLE"], tensor_to_string(robot_q))
         self.redis_client.set(wbc_server_dict["ROBOT_JOINT_VEL"], tensor_to_string(robot_dq))
 

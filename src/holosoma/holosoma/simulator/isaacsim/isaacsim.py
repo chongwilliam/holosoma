@@ -58,6 +58,9 @@ from holosoma.simulator.shared.virtual_gantry import (
 
 from holosoma.simulator.types import ActorNames, ActorIndices, EnvIds, ActorStates, ActorPoses
 
+# Added 
+from holosoma.utils.rotations import quat_apply
+
 class IsaacSim(BaseSimulator):
     def __init__(self, tyro_config: FullSimConfig, terrain_manager: TerrainManager, device: str):
         super().__init__(tyro_config, terrain_manager, device)
@@ -800,9 +803,30 @@ class IsaacSim(BaseSimulator):
         
         for body_name in self.body_names:
             if 'ankle' in body_name:
-                # get orientation, and report contact position in link frame                
+                # Get orientation, and report contact position in link frame                
                 ankle_rot = self._robot.data.body_quat_w[:, self.body_names.index(body_name)][:, [1, 2, 3, 0]]
                 print(ankle_rot)
+                
+                # Convert contact point from world to body frame (dict)
+                foot_contact_position_link_frame = \
+                    quat_apply(ankle_rot, self.robot_config.foot_center + self.contact_positions[:, self._contact_to_robot_body_ids]) 
+                
+                # Compute the angular support basis from geometry
+                if 'right' in body_name:
+                    self.right_foot_contact_state = torch.Tensor([0, 0, 0]) # full contact basis 
+                    if abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
+                        self.right_foot_contact_state[0] = 1
+                        self.right_foot_contact_state[2] = 1
+                    if abs(foot_contact_position_link_frame[1]) > self.robot_config.foot_dimensions[1] / 2:
+                        self.right_foot_contact_state[1] = 1
+                        self.right_foot_contact_state[2] = 1
+                elif 'left' in body_name:
+                    if abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
+                        self.left_foot_contact_state[0] = 1
+                        self.left_foot_contact_state[2] = 1
+                    if abs(foot_contact_position_link_frame[1]) > self.robot_config.foot_dimensions[1] / 2:
+                        self.left_foot_contact_state[1] = 1
+                        self.left_foot_contact_state[2] = 1
 
         self._rigid_body_pos = self._robot.data.body_pos_w[:, self.body_ids, :]
         self._rigid_body_rot = self._robot.data.body_quat_w[:, self.body_ids][
