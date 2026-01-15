@@ -60,7 +60,7 @@ from holosoma.simulator.shared.virtual_gantry import (
 from holosoma.simulator.types import ActorNames, ActorIndices, EnvIds, ActorStates, ActorPoses
 
 # Added 
-from holosoma.utils.rotations import quat_apply
+from holosoma.utils.rotations import quat_apply, quat_inverse
 
 class IsaacSim(BaseSimulator):
     def __init__(self, tyro_config: FullSimConfig, terrain_manager: TerrainManager, device: str):
@@ -313,14 +313,49 @@ class IsaacSim(BaseSimulator):
 
         contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
             prim_path="/World/envs/env_.*/Robot/.*",
+            # prim_path=["/World/envs/env_.*/Robot/right_ankle_roll_link", "/World/envs/env_.*/Robot/left_ankle_roll_link"],
             history_length=self.simulator_config.contact_sensor_history_length,
-            update_period=0.005,
-            track_air_time=True,
-            force_threshold=10.0,
+            # update_period=0.005, 
+            update_period=0.001,
+            track_air_time=False,
+            # force_threshold=10.0,
+            force_threshold=0.1, # added
             debug_vis=True,
             track_contact_points=True, # added
-            filter_prim_paths_expr=["/World/ground"], # added, due to track_contact_points=True
+            filter_prim_paths_expr=["/World/ground/terrain/GroundPlane/CollisionPlane"], # added, due to track_contact_points=True
+            # max_contact_data_count_per_prim=24,
+            # track_pose=True,
         )
+
+        # # Right foot contact
+        # right_foot_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
+        #     prim_path=["/World/envs/env_.*/Robot/right_ankle_roll_link"],
+        #     history_length=self.simulator_config.contact_sensor_history_length,
+        #     # update_period=0.005, 
+        #     update_period=0.001,
+        #     track_air_time=False,
+        #     # force_threshold=10.0,
+        #     force_threshold=0.01, # added
+        #     debug_vis=True,
+        #     track_contact_points=True, # added
+        #     filter_prim_paths_expr=["/World/ground/terrain/GroundPlane/CollisionPlane"], # added, due to track_contact_points=True
+        #     max_contact_data_count_per_prim=24,
+        # )
+
+        # # Left foot contact 
+        # left_foot_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
+        #     prim_path=["/World/envs/env_.*/Robot/left_ankle_roll_link"],
+        #     history_length=self.simulator_config.contact_sensor_history_length,
+        #     # update_period=0.005, 
+        #     update_period=0.001,
+        #     track_air_time=False,
+        #     # force_threshold=10.0,
+        #     force_threshold=0.01, # added
+        #     debug_vis=True,
+        #     track_contact_points=True, # added
+        #     filter_prim_paths_expr=["/World/ground/terrain/GroundPlane/CollisionPlane"], # added, due to track_contact_points=True
+        #     max_contact_data_count_per_prim=24,
+        # )
 
         terrain_prim_path = "/World/ground"
         height_scanner_config = None
@@ -387,6 +422,11 @@ class IsaacSim(BaseSimulator):
 
         self.contact_sensor = ContactSensor(contact_sensor_config)
         self.scene.sensors["contact_sensor"] = self.contact_sensor
+
+        # self.right_foot_contact_sensor = ContactSensor(right_foot_contact_sensor_config)
+        # self.left_foot_contact_sensor = ContactSensor(left_foot_contact_sensor_config)
+        # self.scene.sensors["right_foot_contact_sensor"] = self.right_foot_contact_sensor
+        # self.scene.sensors["left_foot_contact_sensor"] = self.left_foot_contact_sensor
 
         if height_scanner_config:
             self._height_scanner = RayCaster(height_scanner_config)
@@ -635,6 +675,7 @@ class IsaacSim(BaseSimulator):
         'right_knee_link', 'right_ankle_link', 'torso_link', 'left_shoulder_pitch_link',
         'left_shoulder_roll_link', 'left_shoulder_yaw_link', 'left_elbow_link', 'right_shoulder_pitch_link',
         'right_shoulder_roll_link', 'right_shoulder_yaw_link', 'right_elbow_link'])
+
         ipdb> self._robot.find_bodies(robot_config.body_names, preserve_order=False)
         ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
         ['pelvis', 'left_hip_yaw_link', 'right_hip_yaw_link', 'torso_link', 'left_hip_roll_link',
@@ -642,6 +683,23 @@ class IsaacSim(BaseSimulator):
         'right_hip_pitch_link', 'left_shoulder_roll_link', 'right_shoulder_roll_link', 'left_knee_link',
         'right_knee_link', 'left_shoulder_yaw_link', 'right_shoulder_yaw_link', 'left_ankle_link',
         'right_ankle_link', 'left_elbow_link', 'right_elbow_link'])
+
+        ipdb> self._robot.find_bodies(self.robot_config.body_names, preserve_order=True)
+        ([0, 1, 5, 8, 11, 17, 21, 26, 3, 6, 9, 12, 18, 22, 28, 4, 7, 10, 14, 19, 23, 29, 31, 33, 35, 16, 20, 24, 30, 32, 34, 36], 
+        ['pelvis', 'left_hip_pitch_link', 'left_hip_roll_link', 'left_hip_yaw_link', 'left_knee_link', 'left_ankle_pitch_link', 
+        'left_ankle_roll_link', 'left_foot_contact_point', 'right_hip_pitch_link', 'right_hip_roll_link', 'right_hip_yaw_link', 
+        'right_knee_link', 'right_ankle_pitch_link', 'right_ankle_roll_link', 'right_foot_contact_point', 'waist_yaw_link', 
+        'waist_roll_link', 'torso_link', 'left_shoulder_pitch_link', 'left_shoulder_roll_link', 'left_shoulder_yaw_link', 'left_elbow_link', 
+        'left_wrist_roll_link', 'left_wrist_pitch_link', 'left_wrist_yaw_link', 'right_shoulder_pitch_link', 'right_shoulder_roll_link', 
+        'right_shoulder_yaw_link', 'right_elbow_link', 'right_wrist_roll_link', 'right_wrist_pitch_link', 'right_wrist_yaw_link'])
+
+        ipdb> self._robot.find_bodies(self.robot_config.body_names, preserve_order=False)
+        ([0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36], 
+        ['pelvis', 'left_hip_pitch_link', 'right_hip_pitch_link', 'waist_yaw_link', 'left_hip_roll_link', 'right_hip_roll_link', 
+        'waist_roll_link', 'left_hip_yaw_link', 'right_hip_yaw_link', 'torso_link', 'left_knee_link', 'right_knee_link', 'left_shoulder_pitch_link', 
+        'right_shoulder_pitch_link', 'left_ankle_pitch_link', 'right_ankle_pitch_link', 'left_shoulder_roll_link', 'right_shoulder_roll_link', 
+        'left_ankle_roll_link', 'right_ankle_roll_link', 'left_shoulder_yaw_link', 'right_shoulder_yaw_link', 'left_foot_contact_point', 'right_foot_contact_point', 
+        'left_elbow_link', 'right_elbow_link', 'left_wrist_roll_link', 'right_wrist_roll_link', 'left_wrist_pitch_link', 'right_wrist_pitch_link', 'left_wrist_yaw_link', 'right_wrist_yaw_link'])
         """
 
         self.num_dof = len(self.dof_ids)
@@ -665,6 +723,7 @@ class IsaacSim(BaseSimulator):
 
         self._contact_to_robot_body_ids = torch.tensor(
             [self.contact_sensor.body_names.index(body_name) for body_name in self.body_names],
+            # [self.contact_sensor.body_names.index(body_name) for body_name in ['right_ankle_roll_link']],
             device=self.sim_device,
         )
 
@@ -743,6 +802,14 @@ class IsaacSim(BaseSimulator):
             self.num_envs, self.simulator_config.contact_sensor_history_length, self.num_bodies, 3, device=self.device
         )
 
+        # Added: prepare contact state
+        self.right_foot_contact_state = torch.zeros(
+            self.num_envs, 3
+        )
+        self.left_foot_contact_state = torch.zeros(
+            self.num_envs, 3
+        )
+
         # Initialize virtual gantry system after object registry setup
         # Initialize virtual gantry using config
         gantry_cfg = self.simulator_config.virtual_gantry
@@ -802,36 +869,64 @@ class IsaacSim(BaseSimulator):
         # Added: contact positions, rotated to foot frame
         self.contact_positions = self.contact_sensor.data.contact_pos_w[
             :, self._contact_to_robot_body_ids
-        ]  # (num_envs, num_bodies, 3) in world frame (NAN if not in contact)
+        ]  # (num_envs, num_bodies, 3) in world frame (NAN if not in contact)  
 
-        print(self.contact_positions)
-        
-        for body_name in self.body_names:
-            if 'ankle' in body_name:
-                # Get orientation, and report contact position in link frame                
-                ankle_rot = self._robot.data.body_quat_w[:, self.body_names.index(body_name)][:, [1, 2, 3, 0]]
-                print(ankle_rot)
-                
-                # Convert contact point from world to body frame (dict)
-                foot_contact_position_link_frame = \
-                    quat_apply(ankle_rot, self.robot_config.foot_center + self.contact_positions[:, self._contact_to_robot_body_ids]) 
-                
-                # Compute the angular support basis from geometry
-                if 'right' in body_name:
-                    self.right_foot_contact_state = torch.Tensor([0, 0, 0]) # full contact basis 
-                    if abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
-                        self.right_foot_contact_state[0] = 1
-                        self.right_foot_contact_state[2] = 1
-                    if abs(foot_contact_position_link_frame[1]) > self.robot_config.foot_dimensions[1] / 2:
-                        self.right_foot_contact_state[1] = 1
-                        self.right_foot_contact_state[2] = 1
-                elif 'left' in body_name:
-                    if abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
-                        self.left_foot_contact_state[0] = 1
-                        self.left_foot_contact_state[2] = 1
-                    if abs(foot_contact_position_link_frame[1]) > self.robot_config.foot_dimensions[1] / 2:
-                        self.left_foot_contact_state[1] = 1
-                        self.left_foot_contact_state[2] = 1
+        # Contact support 
+        contact_body_ids = [self.body_names.index('right_ankle_roll_link'), self.body_names.index('left_ankle_roll_link')]
+        for i in range(self.num_envs):
+            for body_id in contact_body_ids:
+                if torch.isnan(self.contact_positions[i, body_id]).any():
+                    if 'right' in self.body_names[body_id]:
+                        self.right_foot_contact_state[i, :] = torch.zeros(3)
+                    elif 'left' in self.body_names[body_id]:
+                        self.left_foot_contact_state[i, :] = torch.zeros(3)
+                else:
+                    # Get orientation, and report contact position in link frame                
+                    ankle_rot_world_to_link = quat_inverse(self._robot.data.body_quat_w[i, self.body_ids][body_id][[1, 2, 3, 0]], w_last=True)
+
+                    # Get ankle origin
+                    ankle_position_world = self._robot.data.body_pos_w[i, self.body_ids, :][body_id]
+                    
+                    # Convert contact point from world to body frame (dict)                    
+                    foot_contact_position_link_frame = \
+                        torch.flatten(torch.tensor(self.robot_config.foot_center) + quat_apply(ankle_rot_world_to_link, self.contact_positions[i, body_id, :] - ankle_position_world, w_last=True))
+                    
+                    # Debug
+                    print('Foot contact position link frame: ', foot_contact_position_link_frame)
+                    # print('Ankle origin: ', ankle_position_world)
+                    # print('Sensor origin: ', self.contact_sensor.data.pos_w[i, body_id])
+                    # print('Foot contact position link frame: ', foot_contact_position_link_frame)
+                    # print('Contact position reported: ', self.contact_positions[i, body_id, :])
+                    # print('Contact position delta: ', quat_apply(ankle_rot_world_to_link, self.contact_positions[i, body_id, :] - ankle_position_world, w_last=True))
+                    # print('Contact position delta: ', self.contact_positions[i, body_id, :] - ankle_position_world)
+                    print('Foot bounds: ', self.robot_config.foot_dimension[0] / 2, ', ', self.robot_config.foot_dimension[1] / 2)
+                                        
+                    # Compute the angular support basis from geometry
+                    # X - forward (toe), Y - side
+                    if 'right' in self.body_names[body_id]:
+                        self.right_foot_contact_state[i, :] = torch.zeros(3)
+                        # Angular support about Y axis 
+                        if torch.abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
+                            self.right_foot_contact_state[i, 1] = 1
+                            self.right_foot_contact_state[i, 2] = 1
+                        # Angular support about X axis
+                        if torch.abs(foot_contact_position_link_frame[1]) < self.robot_config.foot_dimension[1] / 2:
+                            self.right_foot_contact_state[i, 0] = 1
+                            self.right_foot_contact_state[i, 2] = 1
+                    elif 'left' in self.body_names[body_id]:
+                        self.left_foot_contact_state[i, :] = torch.zeros(3)
+                        # Angular support about Y axis 
+                        if torch.abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
+                            self.left_foot_contact_state[i, 1] = 1
+                            self.left_foot_contact_state[i, 2] = 1
+                        # Angular support about X axis
+                        if torch.abs(foot_contact_position_link_frame[1]) < self.robot_config.foot_dimension[1] / 2:
+                            self.left_foot_contact_state[i, 0] = 1
+                            self.left_foot_contact_state[i, 2] = 1
+
+        # Print angular basis 
+        print('Right foot contact basis: ', self.right_foot_contact_state)
+        print('Left foot contact basis: ', self.left_foot_contact_state)
 
         self._rigid_body_pos = self._robot.data.body_pos_w[:, self.body_ids, :]
         self._rigid_body_rot = self._robot.data.body_quat_w[:, self.body_ids][
