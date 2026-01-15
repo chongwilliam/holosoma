@@ -93,6 +93,8 @@ class RobotConfig:
     """Name/pattern of auxiliary 'fake' foot link(s) used only to compute foot height/clearance"""
     knee_name: str
     torso_name: str
+    foot_center: list[float]
+    foot_dimension: list[float]
     dof_names: list[str]
     upper_dof_names: list[str]
     upper_left_arm_dof_names: list[str]
