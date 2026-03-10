@@ -43,7 +43,7 @@ wbc_server_dict = {
 
     # output
     "TORQUES_KEY": "wbc::torques",
-    "UPDATE_FLAG_KEY": "wbc::update_done",
+    "UPDATE_FLAG_KEY": "wbc::update_done", # request an update from the controller 
 }
 
 def tensor_to_string(t: torch.Tensor, precision: int = 6) -> str:
@@ -61,6 +61,61 @@ def string_to_tensor(s: str, device=None, dtype=torch.float32) -> torch.Tensor:
     values = s.strip()[1:-1].split(",")
     data = [float(v) for v in values if v.strip()]
     return torch.tensor(data, device=device, dtype=dtype)
+
+def rot6d_to_matrix(x):
+    """
+    6D rotation representation to rotation matrix
+    
+    :param x: 6D rotation vector 
+    """
+    r1 = x[..., 0:3]
+    r2 = x[..., 3:6]
+
+    b1 = torch.nn.functional.normalize(r1, dim=-1)
+    dot = (b1 * r2).sum(dim=-1, keepdim=True)
+    b2 = torch.nn.functional.normalize(r2 - dot * b1, dim=-1)
+
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-1)
+
+def parse_actions(actions: torch.Tensor) -> dict:
+    """
+    Convert action tensor to action mapping 
+    """
+
+    # Full action output
+    action_dict = {
+        "com_pos": actions[:3],
+        "pelvis_ori": actions[3:9],
+        "right_foot_pos": actions[9:12],
+        "right_foot_ori": actions[12:18],
+        "left_foot_pos": actions[18:21],
+        "left_foot_ori": actions[21:24],
+        "right_hand_pos": actions[24:27],
+        "right_hand_ori": actions[27:33],
+        "left_hand_pos": actions[33:36],
+        "left_hand_ori": actions[36:43],
+    }
+
+    # Minimal action output (com and feet position)
+    action_dict = {
+        "com_pos": actions[:3],
+        "right_foot_pos": actions[3:6],
+        "left_foot_pos": actions[6:9],
+    }
+
+    # Lower body action output 
+    action_dict = {
+        "com_pos": actions[:3],
+        "pelvis_ori": actions[3:9],
+        "right_foot_pos": actions[9:12],
+        "right_foot_ori": actions[12:18],
+        "left_foot_pos": actions[18:21],
+        "left_foot_ori": actions[21:24],
+    }
+
+    return action_dict 
+
 
 class JointTorqueActionTerm(ActionTermBase):
     """Action term for joint torque control with whole-body controller.
@@ -122,8 +177,9 @@ class JointTorqueActionTerm(ActionTermBase):
         # Action delay queue will be initialized in setup() after randomization manager is ready
         self.action_queue: torch.Tensor | None = None
 
-        # Redis client for wbc server communication
-        self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
+        # Redis client for wbc server communication (one for each environment)        
+        self.redis_client = [redis.Redis(host='localhost', port=6379, decode_responses=True) for _ in range(env.num_envs)]
+        self.redis_pipe = [self.redis_client[i].pipeline() for i in range(env.num_envs)]
 
     def setup(self) -> None:
         """Setup action term after all managers are initialized.
@@ -205,6 +261,47 @@ class JointTorqueActionTerm(ActionTermBase):
         # Cache velocities for next derivative computation
         self._prev_dof_vel.copy_(self.env.simulator.dof_vel)
 
+
+    def _parse_and_send_actions(self, actions: torch.Tensor, idx: int) -> None:
+        """
+        Docstring for parse_and_send_actions
+        
+        :param actions: Description
+        :type actions: torch.Tensor
+        :param idx: Description
+        :type idx: int
+        """
+
+        action_dict = parse_actions(actions) 
+        str_append = "_" + str(idx)
+
+        # Redis pipeline 
+        for key, value in action_dict:
+            self.redis_pipe[idx].set(key + str_append, tensor_to_string(value))
+
+        self.redis_pipe[idx].execute()
+
+        return None 
+    
+    def _parse_and_send_states(self, states_dict: dict, idx: int) -> None:
+        """
+        Docstring for _parse_and_send_states
+        
+        :param self: Description
+        :param states: Description
+        :type states: torch.Tensor
+        :param idx: Description
+        :type idx: int
+        """
+
+        str_append = "_" + str(idx)
+        for key, value in states_dict:
+            self.redis_pipe[idx].set(key + str_append, tensor_to_string(value))
+        
+        self.redis_pipe[idx].execute()
+
+        return None 
+
     def _compute_torques(self, actions: torch.Tensor) -> torch.Tensor:
         """Compute torques from actions using PD controller.
 
@@ -215,46 +312,51 @@ class JointTorqueActionTerm(ActionTermBase):
             Torque tensor [num_envs, action_dim]
         """
 
+        torques = torch.zero(self.env.simulator.num_envs, torch.shape(actions)[2])
+
         # Get information to send to whole-body control server
-        robot_q = self.env.simulator.dof_pos 
-        robot_dq = self.env.simulator.dof_vel
-        contact_position = self.env.simulator.contact_position
-        
-        for body_name in self.body_names:
-            if 'ankle' in body_name:
-                # Get orientation, and report contact position in link frame                
-                ankle_rot = self._robot.data.body_quat_w[:, self.body_names.index(body_name)][:, [1, 2, 3, 0]]
-                print(ankle_rot)
-                
-                # Convert contact point from world to body frame (dict)
-                self.feet_contact_positions[body_name] = quat_apply(ankle_rot, self.contact_positions[:, self._contact_to_robot_body_ids])
-        
-        self.redis_client.set(wbc_server_dict["ROBOT_JOINT_ANGLE"], tensor_to_string(robot_q))
-        self.redis_client.set(wbc_server_dict["ROBOT_JOINT_VEL"], tensor_to_string(robot_dq))
+        states_dict = {
+            "ROBOT_JOINT_ANGLE": self.env.simulator.dof_pos,
+            "ROBOT_JOINT_VEL": self.env.simulator.dof_vel,
+            "RIGHT_FOOT_ANGULAR_BASIS": tensor_to_string(self.env.simulator.right_foot_contact_basis),
+            "RIGHT_FOOT_CONTACT_POINT": tensor_to_string(self.env.simulator.right_foot_contact_position),
+            "LEFT_FOOT_ANGULAR_BASIS": tensor_to_string(self.env.simulator.left_foot_contact_basis),
+            "LEFT_FOOT_CONTACT_POINT": tensor_to_string(self.env.simulator.left_foot_contact_position),
+        }
 
-        # Scale actions
-        actions_scaled = actions * self.action_scales
+        for i in range(self.env.simulator.num_envs):
+            self._parse_and_send_states(states_dict, i)
+            self._parse_and_send_actions(actions, i)
+            self.redis_client[i].set(wbc_server_dict["UPDATE_FLAG_KEY"] + "_" + str(i), 0)
 
-        # Compute torques based on control type
-        control_type = self.env.robot_config.control.control_type
+            while True:
+                if self.redis_client[i].get(wbc_server_dict["UPDATE_FLAG_KEY"] + "_" + str(i)):
+                    torques[i, :] = self.redis_client[i].get(string_to_tensor(wbc_server_dict["TORQUES_KEY"]))        
+                    break
 
-        if control_type == "P":
-            # Position control
-            torques = (
-                self._kp_scale * self.p_gains * (actions_scaled + self.env.default_dof_pos - self.env.simulator.dof_pos)
-                - self._kd_scale * self.d_gains * self.env.simulator.dof_vel
-            )
-        elif control_type == "V":
-            # Velocity control
-            torques = (
-                self._kp_scale * self.p_gains * (actions_scaled - self.env.simulator.dof_vel)
-                - self._kd_scale * self.d_gains * (self.env.simulator.dof_vel - self._prev_dof_vel) / self.env.sim_dt
-            )
-        elif control_type == "T":
-            # Torque control
-            torques = actions_scaled
-        else:
-            raise ValueError(f"Unknown controller type: {control_type}")
+        # # Scale actions
+        # actions_scaled = actions * self.action_scales
+
+        # # Compute torques based on control type
+        # control_type = self.env.robot_config.control.control_type
+
+        # if control_type == "P":
+        #     # Position control
+        #     torques = (
+        #         self._kp_scale * self.p_gains * (actions_scaled + self.env.default_dof_pos - self.env.simulator.dof_pos)
+        #         - self._kd_scale * self.d_gains * self.env.simulator.dof_vel
+        #     )
+        # elif control_type == "V":
+        #     # Velocity control
+        #     torques = (
+        #         self._kp_scale * self.p_gains * (actions_scaled - self.env.simulator.dof_vel)
+        #         - self._kd_scale * self.d_gains * (self.env.simulator.dof_vel - self._prev_dof_vel) / self.env.sim_dt
+        #     )
+        # elif control_type == "T":
+        #     # Torque control
+        #     torques = actions_scaled
+        # else:
+        #     raise ValueError(f"Unknown controller type: {control_type}")
 
         # Apply torque randomization if configured
         if self._randomize_torque_rfi:
