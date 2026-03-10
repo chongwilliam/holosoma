@@ -885,7 +885,7 @@ class IsaacSim(BaseSimulator):
                     # Convert contact point from world to body frame (dict)                    
                     foot_contact_position_link_frame = \
                         torch.flatten(torch.tensor(self.robot_config.foot_center) + quat_apply(ankle_rot_world_to_link, self.contact_positions[i, body_id, :] - ankle_position_world, w_last=True))
-                    
+                                        
                     # Debug
                     print('Foot contact position link frame: ', foot_contact_position_link_frame)
                     # print('Ankle origin: ', ankle_position_world)
@@ -895,10 +895,11 @@ class IsaacSim(BaseSimulator):
                     # print('Contact position delta: ', quat_apply(ankle_rot_world_to_link, self.contact_positions[i, body_id, :] - ankle_position_world, w_last=True))
                     # print('Contact position delta: ', self.contact_positions[i, body_id, :] - ankle_position_world)
                     print('Foot bounds: ', self.robot_config.foot_dimension[0] / 2, ', ', self.robot_config.foot_dimension[1] / 2)
-                                        
+                    
                     # Compute the angular support basis from geometry
                     # X - forward (toe), Y - side
                     if 'right' in self.body_names[body_id]:
+                        self.right_foot_contact_position[i, :] = foot_contact_position_link_frame
                         self.right_foot_contact_state[i, :] = torch.zeros(3)
                         # Angular support about Y axis 
                         if torch.abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:
@@ -909,6 +910,7 @@ class IsaacSim(BaseSimulator):
                             self.right_foot_contact_state[i, 0] = 1
                             self.right_foot_contact_state[i, 2] = 1
                     elif 'left' in self.body_names[body_id]:
+                        self.left_foot_contact_state[i, :] = foot_contact_position_link_frame
                         self.left_foot_contact_state[i, :] = torch.zeros(3)
                         # Angular support about Y axis 
                         if torch.abs(foot_contact_position_link_frame[0]) < self.robot_config.foot_dimension[0] / 2:

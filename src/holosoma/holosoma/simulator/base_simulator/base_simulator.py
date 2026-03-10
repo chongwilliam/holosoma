@@ -113,6 +113,8 @@ class BaseSimulator:
     dof_vel: torch.Tensor
     right_foot_contact_state: torch.Tensor  # (num_envs, 3): [x, y, z] angular support
     left_foot_contact_state: torch.Tensor # (num_envs, 3): [x, y, z] angular support 
+    right_foot_contact_position: torch.Tensor # (num_envs, 3)
+    left_foot_contact_position: torch.Tensor # (num_envs, 3)
     contact_forces: torch.Tensor
     contact_forces_history: torch.Tensor
     scene: SceneInterface
