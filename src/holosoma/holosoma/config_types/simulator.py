@@ -469,6 +469,17 @@ class BridgeConfig:
 
 
 @dataclass(frozen=True)
+class ContactSupportConfig:
+    """Numerical thresholds for summarizing foot contact geometry."""
+
+    eps: float = 1.0e-6
+    """Minimum planar covariance magnitude required to mark roll/pitch support."""
+
+    eps_det: float = 1.0e-10
+    """Minimum 2D covariance determinant required to mark yaw support."""
+
+
+@dataclass(frozen=True)
 class SimulatorInitConfig:
     """Top-level simulator initialisation configuration."""
 
@@ -508,6 +519,9 @@ class SimulatorInitConfig:
 
     contact_sensor_history_length: int = 3
     """Number of frames of contact data retained for sensors."""
+
+    contact_support: ContactSupportConfig = field(default_factory=ContactSupportConfig)
+    """Numerical thresholds used to derive foot contact barycenters and support axes."""
 
     robot_mjcf_filter: MujocoXMLFilterCfg = field(default_factory=MujocoXMLFilterCfg)
     """MuJoCo-specific XML filtering configuration for robot MJCF files."""

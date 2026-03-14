@@ -112,10 +112,14 @@ class BaseSimulator:
     base_quat: torch.Tensor
     dof_pos: torch.Tensor
     dof_vel: torch.Tensor
-    right_foot_contact_state: torch.Tensor  # (num_envs, 3): [x, y, z] angular support
-    left_foot_contact_state: torch.Tensor # (num_envs, 3): [x, y, z] angular support 
-    right_foot_contact_position: torch.Tensor # (num_envs, 3)
-    left_foot_contact_position: torch.Tensor # (num_envs, 3)
+    right_foot_contact_basis: torch.Tensor  # (num_envs, 3): [roll, pitch, yaw] support
+    left_foot_contact_basis: torch.Tensor  # (num_envs, 3): [roll, pitch, yaw] support
+    right_foot_contact_state: torch.Tensor  # Backward-compatible alias of right_foot_contact_basis
+    left_foot_contact_state: torch.Tensor  # Backward-compatible alias of left_foot_contact_basis
+    right_foot_contact_position: torch.Tensor  # (num_envs, 3): contact barycenter in foot frame
+    left_foot_contact_position: torch.Tensor  # (num_envs, 3): contact barycenter in foot frame
+    right_foot_contact_count: torch.Tensor  # (num_envs,)
+    left_foot_contact_count: torch.Tensor  # (num_envs,)
     contact_forces: torch.Tensor
     contact_forces_history: torch.Tensor
     scene: SceneInterface
@@ -167,6 +171,7 @@ class BaseSimulator:
 
         # Bridge system
         self.bridge: SimulatorBridge | None = None
+        self._mujoco_contact_support_warning_emitted = False
 
         # To be overridden by subclasses
         self.height_samples = None
@@ -181,6 +186,73 @@ class BaseSimulator:
         # force video recording when headless_recording=true for backwards compatibility
         video_recording_enabled = self.logger_cfg.headless_recording or self.video_config.enabled
         self.video_config = dataclasses.replace(self.video_config, enabled=video_recording_enabled)
+
+    def _initialize_foot_contact_buffers(self) -> None:
+        """Allocate shared foot-contact summary buffers."""
+        self.right_foot_contact_basis = torch.zeros(self.num_envs, 3, device=self.sim_device, dtype=torch.float32)
+        self.left_foot_contact_basis = torch.zeros_like(self.right_foot_contact_basis)
+        self.right_foot_contact_state = self.right_foot_contact_basis
+        self.left_foot_contact_state = self.left_foot_contact_basis
+        self.right_foot_contact_position = torch.zeros(self.num_envs, 3, device=self.sim_device, dtype=torch.float32)
+        self.left_foot_contact_position = torch.zeros_like(self.right_foot_contact_position)
+        self.right_foot_contact_count = torch.zeros(self.num_envs, device=self.sim_device, dtype=torch.long)
+        self.left_foot_contact_count = torch.zeros_like(self.right_foot_contact_count)
+
+    def _clear_foot_contact_buffers(self) -> None:
+        """Reset shared foot-contact summary buffers to the no-contact state."""
+        self.right_foot_contact_basis.zero_()
+        self.left_foot_contact_basis.zero_()
+        self.right_foot_contact_position.zero_()
+        self.left_foot_contact_position.zero_()
+        self.right_foot_contact_count.zero_()
+        self.left_foot_contact_count.zero_()
+
+    def _find_foot_body_indices(self) -> dict[str, int]:
+        """Resolve left/right foot body indices from configured body names."""
+        candidates = [
+            (idx, name) for idx, name in enumerate(self.body_names) if self.robot_config.foot_body_name in name
+        ]
+        foot_indices: dict[str, int] = {}
+        for side in ("right", "left"):
+            match = next((idx for idx, name in candidates if side in name.lower()), None)
+            if match is None:
+                raise ValueError(
+                    f"Could not resolve the {side} foot body using foot_body_name='{self.robot_config.foot_body_name}'."
+                )
+            foot_indices[side] = match
+        return foot_indices
+
+    def _summarize_local_foot_contacts(self, local_contact_points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return barycenter and supported local rotational axes for foot-frame contacts."""
+        if local_contact_points.numel() == 0:
+            barycenter = torch.zeros(3, device=self.sim_device, dtype=torch.float32)
+            support_axes = torch.zeros(3, device=self.sim_device, dtype=torch.float32)
+            return barycenter, support_axes
+
+        local_contact_points = local_contact_points.to(device=self.sim_device, dtype=torch.float32)
+        barycenter = local_contact_points.mean(dim=0)
+        support_axes = torch.zeros(3, device=self.sim_device, dtype=torch.float32)
+        half_length = 0.5 * float(self.robot_config.foot_dimension[0])
+        half_width = 0.5 * float(self.robot_config.foot_dimension[1])
+        eps = float(self.simulator_config.contact_support.eps)
+
+        x = float(barycenter[0].item())
+        y = float(barycenter[1].item())
+
+        interior_x = abs(x) < (half_length - eps)
+        interior_y = abs(y) < (half_width - eps)
+        on_x_face = abs(x) <= (half_length + eps)
+        on_y_face = abs(y) <= (half_width + eps)
+
+        if interior_x and interior_y:
+            support_axes[:] = 1.0
+        elif not interior_x and on_x_face and interior_y:
+            support_axes[0] = 1.0
+            support_axes[2] = 1.0
+        elif interior_x and not interior_y and on_y_face:
+            support_axes[1] = 1.0
+            support_axes[2] = 1.0
+        return barycenter, support_axes
 
     # ----- Configuration Setup Methods -----
 

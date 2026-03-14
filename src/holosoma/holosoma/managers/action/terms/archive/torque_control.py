@@ -2,18 +2,49 @@
 
 from __future__ import annotations
 
-import importlib
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import torch
 
 from holosoma.managers.action.base import ActionTermBase
 
 if TYPE_CHECKING:
     from holosoma.config_types.action import ActionTermCfg
+
+import redis 
+
+wbc_server_dict = {
+    "ROBOT_UPDATE": "wbc::update::",
+    "ROBOT_JOINT_ANGLE": "wbc::robot_q::",
+    "ROBOT_JOINT_VEL": "wbc::robot_dq::",
+
+    "DESIRED_STATE": "wbc::state",
+
+    "DESIRED_COM_POSITION": "wbc::com::pos",
+    "DESIRED_TORSO_ORIENTATION": "wbc::com::ori",
+    "DESIRED_RIGHT_HAND_POSITION": "wbc::right_hand::pos",
+    "DESIRED_RIGHT_HAND_ORIENTATION": "wbc::right_hand::ori",
+    "DESIRED_RIGHT_FOOT_POSITION": "wbc::right_foot::pos",
+    "DESIRED_RIGHT_FOOT_ORIENTATION": "wbc::right_foot::ori",
+    "DESIRED_LEFT_HAND_POSITION": "wbc::left_hand::pos",
+    "DESIRED_LEFT_HAND_ORIENTATION": "wbc::left_hand::ori",
+    "DESIRED_LEFT_FOOT_POSITION": "wbc::left_foot::pos",
+    "DESIRED_LEFT_FOOT_ORIENTATION": "wbc::left_foot::ori",   
+
+    # contact state (contact point, contact angular basis)
+    "RIGHT_FOOT_CONTACT_POINT": "wbc::right_foot::contact_point",
+    "RIGHT_FOOT_ANGULAR_BASIS": "wbc::right_foot::angular_basis",
+    "RIGHT_TOE_CONTACT_POINT": "wbc::right_toe::contact_point",
+    "RIGHT_TOE_ANGULAR_BASIS": "wbc::right_toe::angular_basis",
+    "LEFT_FOOT_CONTACT_POINT": "wbc::left_foot::contact_point",
+    "LEFT_FOOT_ANGULAR_BASIS": "wbc::left_foot::angular_basis",
+    "LEFT_TOE_CONTACT_POINT": "wbc::left_toe::contact_point",
+    "LEFT_TOE_ANGULAR_BASIS": "wbc::left_toe::angular_basis",
+
+    # output
+    "TORQUES_KEY": "wbc::torques",
+    "UPDATE_FLAG_KEY": "wbc::update_done", # request an update from the controller 
+}
 
 def tensor_to_string(t: torch.Tensor, precision: int = 6) -> str:
     """
@@ -47,73 +78,41 @@ def rot6d_to_matrix(x):
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-1)
 
-
-def axis_angle_to_matrix(axis_angle: np.ndarray) -> np.ndarray:
-    angle = float(np.linalg.norm(axis_angle))
-    if angle < 1.0e-9:
-        return np.eye(3)
-
-    axis = axis_angle / angle
-    x, y, z = axis
-    skew = np.array(
-        [
-            [0.0, -z, y],
-            [z, 0.0, -x],
-            [-y, x, 0.0],
-        ],
-        dtype=float,
-    )
-    return np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
-
 def parse_actions(actions: torch.Tensor) -> dict:
     """
     Convert action tensor to action mapping 
     """
 
-    # # Full action output
-    # action_dict = {
-    #     "com_pos": actions[:3],
-    #     "pelvis_ori": actions[3:9],
-    #     "right_foot_pos": actions[9:12],
-    #     "right_foot_ori": actions[12:18],
-    #     "left_foot_pos": actions[18:21],
-    #     "left_foot_ori": actions[21:24],
-    #     "right_hand_pos": actions[24:27],
-    #     "right_hand_ori": actions[27:33],
-    #     "left_hand_pos": actions[33:36],
-    #     "left_hand_ori": actions[36:43],
-    # }
-
     # Full action output
     action_dict = {
         "com_pos": actions[:3],
-        "pelvis_ori": actions[3:6],
-        "right_foot_pos": actions[6:9],
-        "right_foot_ori": actions[9:12],
-        "left_foot_pos": actions[12:15],
-        "left_foot_ori": actions[15:18],
-        "right_hand_pos": actions[18:21],
-        "right_hand_ori": actions[21:24],
-        "left_hand_pos": actions[24:27],
-        "left_hand_ori": actions[27:30],
+        "pelvis_ori": actions[3:9],
+        "right_foot_pos": actions[9:12],
+        "right_foot_ori": actions[12:18],
+        "left_foot_pos": actions[18:21],
+        "left_foot_ori": actions[21:24],
+        "right_hand_pos": actions[24:27],
+        "right_hand_ori": actions[27:33],
+        "left_hand_pos": actions[33:36],
+        "left_hand_ori": actions[36:43],
     }
 
-    # # Minimal action output (com and feet position)
-    # action_dict = {
-    #     "com_pos": actions[:3],
-    #     "right_foot_pos": actions[3:6],
-    #     "left_foot_pos": actions[6:9],
-    # }
+    # Minimal action output (com and feet position)
+    action_dict = {
+        "com_pos": actions[:3],
+        "right_foot_pos": actions[3:6],
+        "left_foot_pos": actions[6:9],
+    }
 
-    # # Lower body action output 
-    # action_dict = {
-    #     "com_pos": actions[:3],
-    #     "pelvis_ori": actions[3:9],
-    #     "right_foot_pos": actions[9:12],
-    #     "right_foot_ori": actions[12:18],
-    #     "left_foot_pos": actions[18:21],
-    #     "left_foot_ori": actions[21:24],
-    # }
+    # Lower body action output 
+    action_dict = {
+        "com_pos": actions[:3],
+        "pelvis_ori": actions[3:9],
+        "right_foot_pos": actions[9:12],
+        "right_foot_ori": actions[12:18],
+        "left_foot_pos": actions[18:21],
+        "left_foot_ori": actions[21:24],
+    }
 
     return action_dict 
 
@@ -121,8 +120,8 @@ def parse_actions(actions: torch.Tensor) -> dict:
 class JointTorqueActionTerm(ActionTermBase):
     """Action term for joint torque control with whole-body controller.
 
-    This term processes raw actions as task space targets and computes
-    torques using a WBC controller. Supports:
+    This term processes raw actions as joint position targets and computes
+    torques using a PD controller. Supports:
     - Action scaling
     - Action clipping
     - Action delay (if configured)
@@ -178,8 +177,9 @@ class JointTorqueActionTerm(ActionTermBase):
         # Action delay queue will be initialized in setup() after randomization manager is ready
         self.action_queue: torch.Tensor | None = None
 
-        self.wbc = self._create_wbc_engine(cfg.wbc_extension_dir, cfg.params)
-        self._prev_wbc_state: int | None = None
+        # Redis client for wbc server communication (one for each environment)        
+        self.redis_client = [redis.Redis(host='localhost', port=6379, decode_responses=True) for _ in range(env.num_envs)]
+        self.redis_pipe = [self.redis_client[i].pipeline() for i in range(env.num_envs)]
 
     def setup(self) -> None:
         """Setup action term after all managers are initialized.
@@ -303,7 +303,7 @@ class JointTorqueActionTerm(ActionTermBase):
         return None 
 
     def _compute_torques(self, actions: torch.Tensor) -> torch.Tensor:
-        """Compute torques from the in-process whole-body controller.
+        """Compute torques from actions using PD controller.
 
         Args:
             actions: Action tensor [num_envs, action_dim]
@@ -311,87 +311,28 @@ class JointTorqueActionTerm(ActionTermBase):
         Returns:
             Torque tensor [num_envs, action_dim]
         """
-        num_envs = actions.shape[0]
-        torques = torch.zeros(num_envs, self._action_dim, device=actions.device, dtype=self.torques.dtype)
-        action_scale = float(self.env.robot_config.control.action_scale)
 
-        left_stance = 0
-        right_stance = 1
-        dual_stance = 2
-        floating = 12
+        torques = torch.zero(self.env.simulator.num_envs, torch.shape(actions)[2])
 
-        for env_idx in range(num_envs):
-            q = self.env.simulator.dof_pos[env_idx].detach().cpu().numpy()
-            dq = self.env.simulator.dof_vel[env_idx].detach().cpu().numpy()
-            self.wbc.updateRobot(q, dq)
+        # Get information to send to whole-body control server
+        states_dict = {
+            "ROBOT_JOINT_ANGLE": self.env.simulator.dof_pos,
+            "ROBOT_JOINT_VEL": self.env.simulator.dof_vel,
+            "RIGHT_FOOT_ANGULAR_BASIS": tensor_to_string(self.env.simulator.right_foot_contact_basis),
+            "RIGHT_FOOT_CONTACT_POINT": tensor_to_string(self.env.simulator.right_foot_contact_position),
+            "LEFT_FOOT_ANGULAR_BASIS": tensor_to_string(self.env.simulator.left_foot_contact_basis),
+            "LEFT_FOOT_CONTACT_POINT": tensor_to_string(self.env.simulator.left_foot_contact_position),
+        }
 
-            right_contact_count = int(self.env.simulator.right_foot_contact_count[env_idx].item())
-            left_contact_count = int(self.env.simulator.left_foot_contact_count[env_idx].item())
-            if right_contact_count > 0 and left_contact_count > 0:
-                curr_state = dual_stance
-            elif right_contact_count > 0:
-                curr_state = right_stance
-            elif left_contact_count > 0:
-                curr_state = left_stance
-            else:
-                curr_state = floating
+        for i in range(self.env.simulator.num_envs):
+            self._parse_and_send_states(states_dict, i)
+            self._parse_and_send_actions(actions, i)
+            self.redis_client[i].set(wbc_server_dict["UPDATE_FLAG_KEY"] + "_" + str(i), 0)
 
-            if curr_state != self._prev_wbc_state:
-                self.wbc.reInitializeTask(curr_state)
-                self._prev_wbc_state = curr_state
-
-            right_contact_point = self.env.simulator.right_foot_contact_position[env_idx].detach().cpu().numpy()
-            left_contact_point = self.env.simulator.left_foot_contact_position[env_idx].detach().cpu().numpy()
-            right_contact_basis = np.diag(
-                self.env.simulator.right_foot_contact_basis[env_idx].detach().cpu().numpy().astype(float)
-            )
-            left_contact_basis = np.diag(
-                self.env.simulator.left_foot_contact_basis[env_idx].detach().cpu().numpy().astype(float)
-            )
-            self.wbc.updateContactState(
-                curr_state,
-                right_contact_point,
-                right_contact_basis,
-                left_contact_point,
-                left_contact_basis,
-            )
-
-            # Get current pose
-            com_pose = np.asarray(self.wbc.getPose("com"), dtype=float)
-            torso_pose = np.asarray(self.wbc.getPose("torso"), dtype=float)
-            right_foot_pose = np.asarray(self.wbc.getPose("right_foot"), dtype=float)
-            left_foot_pose = np.asarray(self.wbc.getPose("left_foot"), dtype=float)
-            pelvis_rotation = np.asarray(self.wbc.getRotation("pelvis"), dtype=float)
-
-            # Get actions 
-            action_dict = parse_actions(actions[env_idx] * action_scale)
-            com_pos = action_dict["com_pos"].detach().cpu().numpy() + com_pose[:3, 3]
-            pelvis_ori = axis_angle_to_matrix(action_dict["pelvis_ori"].detach().cpu().numpy()) @ pelvis_rotation
-            torso_ori = torso_pose[:3, :3]
-            right_foot_pos = action_dict["right_foot_pos"].detach().cpu().numpy() + right_foot_pose[:3, 3]
-            right_foot_ori = (
-                axis_angle_to_matrix(action_dict["right_foot_ori"].detach().cpu().numpy()) @ right_foot_pose[:3, :3]
-            )
-            left_foot_pos = action_dict["left_foot_pos"].detach().cpu().numpy() + left_foot_pose[:3, 3]
-            left_foot_ori = (
-                axis_angle_to_matrix(action_dict["left_foot_ori"].detach().cpu().numpy()) @ left_foot_pose[:3, :3]
-            )
-
-            # Compute torques
-            torque_np = np.asarray(
-                self.wbc.compute(
-                    curr_state,
-                    com_pos,
-                    pelvis_ori,
-                    torso_ori,
-                    right_foot_pos,
-                    right_foot_ori,
-                    left_foot_pos,
-                    left_foot_ori,
-                ),
-                dtype=float,
-            ).reshape(-1)
-            torques[env_idx] = torch.as_tensor(torque_np, device=actions.device, dtype=self.torques.dtype)
+            while True:
+                if self.redis_client[i].get(wbc_server_dict["UPDATE_FLAG_KEY"] + "_" + str(i)):
+                    torques[i, :] = self.redis_client[i].get(string_to_tensor(wbc_server_dict["TORQUES_KEY"]))        
+                    break
 
         # # Scale actions
         # actions_scaled = actions * self.action_scales
@@ -552,55 +493,3 @@ class JointTorqueActionTerm(ActionTermBase):
                     self.action_scales[i] = control_cfg.action_scale * effort / stiffness
         else:
             self.action_scales[:] = control_cfg.action_scale
-
-    # WBC import helpers
-    def _repo_root() -> Path:
-        return Path(__file__).resolve().parents[1]
-
-    def _extension_root(extension_dir: str | None = None) -> Path:
-        if extension_dir:
-            resolved = Path(extension_dir).expanduser().resolve()
-            if resolved.name == "build":
-                return resolved.parent
-            return resolved
-        return self._repo_root()
-
-    def _try_add_local_extension_path(module_name: str, extension_dir: str | None = None) -> None:
-        search_roots = []
-        if extension_dir:
-            search_roots.append(Path(extension_dir).expanduser().resolve())
-        search_roots.extend([self._repo_root() / "build", self._repo_root()])
-
-        for base in search_roots:
-            if not base.exists():
-                continue
-            for pattern in (f"{module_name}*.so", f"{module_name}*.pyd", f"{module_name}*.dylib"):
-                for candidate in base.rglob(pattern):
-                    module_dir = str(candidate.parent)
-                    if module_dir not in sys.path:
-                        sys.path.insert(0, module_dir)
-                    return
-
-
-    def _import_wbc_module(extension_dir: str | None = None):
-        module_name = "humanoid_wbc"
-        try:
-            return importlib.import_module(module_name)
-        except Exception:
-            self._try_add_local_extension_path(module_name, extension_dir)
-            return importlib.import_module(module_name)
-
-    def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any]):
-        wbc_module = self._import_wbc_module(extension_dir)
-        extension_root = self._extension_root(extension_dir)
-        robot_file = Path(params.get("robot_file", extension_root / "models" / "hrp4c" / "HRP4c.urdf"))
-        yaml_file = Path(params.get("yaml_file", extension_root / "params" / "hrp4c_parameters.yaml"))
-        robot_name = params.get("robot_name", "hrp4c")
-
-        if not robot_file.exists() or not yaml_file.exists():
-            raise FileNotFoundError(
-                "Whole-body controller assets are missing. "
-                f"robot_file={robot_file}, yaml_file={yaml_file}"
-            )
-
-        return wbc_module.WbcEngine(str(robot_file), str(yaml_file), robot_name)

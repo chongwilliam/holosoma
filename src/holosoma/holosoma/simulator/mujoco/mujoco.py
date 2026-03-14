@@ -30,6 +30,7 @@ from holosoma.simulator.shared.object_registry import ObjectType
 from holosoma.simulator.shared.virtual_gantry import create_virtual_gantry
 from holosoma.simulator.types import ActorIndices, ActorNames, ActorPoses, ActorStates, EnvIds
 from holosoma.utils.adapters import mujoco_draw_adapter
+from holosoma.utils.rotations import quat_apply, quat_inverse
 
 
 class MuJoCoScene:
@@ -745,6 +746,8 @@ class MuJoCo(BaseSimulator):
         self._rigid_body_ang_vel = torch.zeros(
             self.num_envs, self.num_bodies, 3, device=self.sim_device, dtype=torch.float32
         )
+        self._initialize_foot_contact_buffers()
+        self._foot_body_indices = self._find_foot_body_indices()
 
     def prepare_randomization_fields(self, field_names: list[str]) -> None:
         """Prepare model fields for per-environment randomization.
@@ -830,6 +833,8 @@ class MuJoCo(BaseSimulator):
         if hasattr(self, "contact_forces_history") and hasattr(self, "contact_forces"):
             self.backend.refresh_sim_tensors(self.contact_forces_history)
 
+        self._update_foot_contact_summary()
+
     def clear_contact_forces_history(self, env_ids: torch.Tensor) -> None:
         """Clear contact forces history for specified environments.
 
@@ -840,6 +845,63 @@ class MuJoCo(BaseSimulator):
         """
         if len(env_ids) > 0:
             self.contact_forces_history[env_ids, :, :, :] = 0.0
+
+    def _update_foot_contact_summary(self) -> None:
+        """Compute foot contact barycenters and supported axes from MuJoCo contacts."""
+        self._clear_foot_contact_buffers()
+
+        if self.simulator_config.mujoco_backend != MujocoBackend.CLASSIC:
+            if not self._mujoco_contact_support_warning_emitted:
+                logger.warning(
+                    "Foot contact barycenter/support extraction is only implemented for MuJoCo ClassicBackend. "
+                    "Warp backend will report zeros."
+                )
+                self._mujoco_contact_support_warning_emitted = True
+            return
+
+        assert self.root_model
+        assert self.root_data
+
+        foot_world_points: dict[str, list[torch.Tensor]] = {"right": [], "left": []}
+        for contact_idx in range(self.root_data.ncon):
+            contact = self.root_data.contact[contact_idx]
+            for geom_id in (contact.geom1, contact.geom2):
+                mujoco_body_id = self.root_model.geom_bodyid[geom_id]
+                holosoma_body_idx = self.mujoco_to_holosoma_body_map.get(mujoco_body_id)
+                if holosoma_body_idx is None:
+                    continue
+                for side, foot_body_idx in self._foot_body_indices.items():
+                    if holosoma_body_idx == foot_body_idx:
+                        foot_world_points[side].append(
+                            torch.tensor(contact.pos.copy(), device=self.sim_device, dtype=torch.float32)
+                        )
+                        break
+
+        foot_center = torch.tensor(self.robot_config.foot_center, device=self.sim_device, dtype=torch.float32)
+        for side, world_points in foot_world_points.items():
+            if not world_points:
+                continue
+
+            foot_body_idx = self._foot_body_indices[side]
+            points_w = torch.stack(world_points, dim=0)
+            foot_quat_w = self._rigid_body_rot[0, foot_body_idx]
+            foot_quat_inv = quat_inverse(foot_quat_w, w_last=True).unsqueeze(0).repeat(points_w.shape[0], 1)
+            foot_pos_w = self._rigid_body_pos[0, foot_body_idx]
+            local_contact_points = foot_center.unsqueeze(0) + quat_apply(
+                foot_quat_inv,
+                points_w - foot_pos_w.unsqueeze(0),
+                w_last=True,
+            )
+            barycenter, support_axes = self._summarize_local_foot_contacts(local_contact_points)
+
+            if side == "right":
+                self.right_foot_contact_position[0, :] = barycenter
+                self.right_foot_contact_basis[0, :] = support_axes
+                self.right_foot_contact_count[0] = points_w.shape[0]
+            else:
+                self.left_foot_contact_position[0, :] = barycenter
+                self.left_foot_contact_basis[0, :] = support_axes
+                self.left_foot_contact_count[0] = points_w.shape[0]
 
     def apply_torques_at_dof(self, torques: torch.Tensor) -> None:
         """Apply torques with backend-specific optimization.

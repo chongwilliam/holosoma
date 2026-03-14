@@ -24,6 +24,9 @@ class ActionTermCfg:
     clip: tuple[float, float] | None = None
     """Optional min/max clamp applied to the raw action values."""
 
+    wbc_extension_dir: str
+    """Import path to the whole-body controller"""
+
 
 @dataclass(frozen=True)
 class ActionManagerCfg:
