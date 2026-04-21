@@ -178,8 +178,19 @@ class JointTorqueActionTerm(ActionTermBase):
         # Action delay queue will be initialized in setup() after randomization manager is ready
         self.action_queue: torch.Tensor | None = None
 
-        self.wbc = self._create_wbc_engine(cfg.wbc_extension_dir, cfg.params)
-        self._prev_wbc_state: int | None = None
+        self._foot_body_indices = self._resolve_foot_body_indices(env)
+        self._wbc_module = self._import_wbc_module(cfg.wbc_extension_dir)
+        self.State = self._wbc_module.State
+        self.Phase = self._wbc_module.Phase
+        self.wbc = [
+            self._create_wbc_engine(cfg.wbc_extension_dir, cfg.params, self._wbc_module)
+            for _ in range(env.num_envs)
+        ]
+        self.curr_state = [self.State.DUAL_STANCE for _ in range(env.num_envs)]
+        self._prev_wbc_state: Any | None = None
+        self.transition_start_time = [0.0 for _ in range(env.num_envs)]
+        for i in range(env.num_envs):
+            self.wbc[i].setTotalTransitionTime(0.15)  # hard-coded for now
 
     def setup(self) -> None:
         """Setup action term after all managers are initialized.
@@ -315,30 +326,26 @@ class JointTorqueActionTerm(ActionTermBase):
         torques = torch.zeros(num_envs, self._action_dim, device=actions.device, dtype=self.torques.dtype)
         action_scale = float(self.env.robot_config.control.action_scale)
 
-        left_stance = 0
-        right_stance = 1
-        dual_stance = 2
-        floating = 12
-
         for env_idx in range(num_envs):
             q = self.env.simulator.dof_pos[env_idx].detach().cpu().numpy()
             dq = self.env.simulator.dof_vel[env_idx].detach().cpu().numpy()
-            self.wbc.updateRobot(q, dq)
+            self.wbc[env_idx].updateRobot(q, dq)
 
-            right_contact_count = int(self.env.simulator.right_foot_contact_count[env_idx].item())
-            left_contact_count = int(self.env.simulator.left_foot_contact_count[env_idx].item())
-            if right_contact_count > 0 and left_contact_count > 0:
-                curr_state = dual_stance
-            elif right_contact_count > 0:
-                curr_state = right_stance
-            elif left_contact_count > 0:
-                curr_state = left_stance
-            else:
-                curr_state = floating
+            # Get contact state from control from humanoid
+            # right_contact_count = int(self.env.simulator.right_foot_contact_count[env_idx].item())
+            # left_contact_count = int(self.env.simulator.left_foot_contact_count[env_idx].item())
+            # if right_contact_count > 0 and left_contact_count > 0:
+            #     curr_state = self.State.DUAL_STANCE
+            # elif right_contact_count > 0:
+            #     curr_state = self.State.RIGHT_STANCE
+            # elif left_contact_count > 0:
+            #     curr_state = self.State.LEFT_STANCE
+            # else:
+            #     curr_state = self.State.FLOATING
 
-            if curr_state != self._prev_wbc_state:
-                self.wbc.reInitializeTask(curr_state)
-                self._prev_wbc_state = curr_state
+            # if curr_state != self._prev_wbc_state:
+            #     self.wbc[env_idx].reInitializeTask(curr_state)
+            #     self._prev_wbc_state = curr_state
 
             right_contact_point = self.env.simulator.right_foot_contact_position[env_idx].detach().cpu().numpy()
             left_contact_point = self.env.simulator.left_foot_contact_position[env_idx].detach().cpu().numpy()
@@ -348,20 +355,37 @@ class JointTorqueActionTerm(ActionTermBase):
             left_contact_basis = np.diag(
                 self.env.simulator.left_foot_contact_basis[env_idx].detach().cpu().numpy().astype(float)
             )
-            self.wbc.updateContactState(
-                curr_state,
+            right_foot_grf = self._foot_ground_reaction_wrench(env_idx, "right")
+            left_foot_grf = self._foot_ground_reaction_wrench(env_idx, "left")
+
+            # Update stance support from contact information
+            self.wbc[env_idx].updateStanceSupport(
+                self.State.NUM_STATES,
                 right_contact_point,
                 right_contact_basis,
                 left_contact_point,
                 left_contact_basis,
             )
 
+            # Query the stance switching logic
+            curr_state = self.curr_state[env_idx]
+            if curr_state == self.State.DUAL_STANCE:
+                self.curr_state[env_idx] = self.wbc[env_idx].getContactTransitionFromDualStance(
+                    right_foot_grf, left_foot_grf
+                )
+            elif curr_state in (self.State.LEFT_STANCE, self.State.RIGHT_STANCE):
+                self.curr_state[env_idx] = self.wbc[env_idx].getContactTransitionFromSingleStance(
+                    curr_state,
+                    right_foot_grf,
+                    left_foot_grf,
+                )
+
             # Get current pose
-            com_pose = np.asarray(self.wbc.getPose("com"), dtype=float)
-            torso_pose = np.asarray(self.wbc.getPose("torso"), dtype=float)
-            right_foot_pose = np.asarray(self.wbc.getPose("right_foot"), dtype=float)
-            left_foot_pose = np.asarray(self.wbc.getPose("left_foot"), dtype=float)
-            pelvis_rotation = np.asarray(self.wbc.getRotation("pelvis"), dtype=float)
+            com_pose = np.asarray(self.wbc[env_idx].getPose("com"), dtype=float)
+            torso_pose = np.asarray(self.wbc[env_idx].getPose("torso"), dtype=float)
+            right_foot_pose = np.asarray(self.wbc[env_idx].getPose("right_foot"), dtype=float)
+            left_foot_pose = np.asarray(self.wbc[env_idx].getPose("left_foot"), dtype=float)
+            pelvis_rotation = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)
 
             # Get actions 
             action_dict = parse_actions(actions[env_idx] * action_scale)
@@ -378,19 +402,32 @@ class JointTorqueActionTerm(ActionTermBase):
             )
 
             # Compute torques
-            torque_np = np.asarray(
-                self.wbc.compute(
-                    curr_state,
-                    com_pos,
-                    pelvis_ori,
-                    torso_ori,
-                    right_foot_pos,
-                    right_foot_ori,
-                    left_foot_pos,
-                    left_foot_ori,
-                ),
-                dtype=float,
-            ).reshape(-1)
+            # Stance transition torques
+            sim_time = self.env.simulator.time()
+            if self.curr_state[env_idx] not in (self.State.DUAL_STANCE, self.State.LEFT_STANCE, self.State.RIGHT_STANCE):
+                normalized_time = (sim_time - self.transition_start_time[env_idx]) / self.wbc[env_idx].getTotalTransitionTime()
+                normalized_time = min(max(normalized_time, 0.0), 1.0)
+                transition_done, torque_wbc = self.wbc[env_idx].computeContactTransferOutput(self._wbc_module.getPhaseFromState(int(self.curr_state[env_idx])), normalized_time)
+                torque_np = np.asarray(torque_wbc, dtype=float).reshape(-1)
+                if transition_done:
+                    # Transition to next state
+                    self.curr_state[env_idx] = self._wbc_module.getNextStateFromTransition(self.curr_state[env_idx])
+            else:
+                self.transition_start_time[env_idx] = sim_time
+                torque_np = np.asarray(
+                    self.wbc[env_idx].compute(
+                        self.curr_state[env_idx],
+                        com_pos,
+                        pelvis_ori,
+                        torso_ori,
+                        right_foot_pos,
+                        right_foot_ori,
+                        left_foot_pos,
+                        left_foot_ori,
+                    ),
+                    dtype=float,
+                ).reshape(-1)
+
             torques[env_idx] = torch.as_tensor(torque_np, device=actions.device, dtype=self.torques.dtype)
 
         # # Scale actions
@@ -417,12 +454,12 @@ class JointTorqueActionTerm(ActionTermBase):
         # else:
         #     raise ValueError(f"Unknown controller type: {control_type}")
 
-        # Apply torque randomization if configured
-        if self._randomize_torque_rfi:
-            torques = (
-                torques
-                + (torch.rand_like(torques) * 2.0 - 1.0) * self._rfi_lim * self._rfi_lim_scale * self.env.torque_limits
-            )
+        # # Apply torque randomization if configured
+        # if self._randomize_torque_rfi:
+        #     torques = (
+        #         torques
+        #         + (torch.rand_like(torques) * 2.0 - 1.0) * self._rfi_lim * self._rfi_lim_scale * self.env.torque_limits
+        #     )
 
         # Clip torques if configured
         if self.env.robot_config.control.clip_torques:
@@ -497,6 +534,40 @@ class JointTorqueActionTerm(ActionTermBase):
 
     # ------------------------------------------------------------------
     # Internal helpers
+
+    def _resolve_foot_body_indices(self, env: Any) -> dict[str, int]:
+        """Resolve simulator body indices used to read per-foot ground reaction forces."""
+        simulator_indices = getattr(env.simulator, "_foot_body_indices", None)
+        if simulator_indices is not None:
+            return {"right": int(simulator_indices["right"]), "left": int(simulator_indices["left"])}
+
+        candidates = [
+            (idx, name)
+            for idx, name in enumerate(env.simulator.body_names)
+            if env.robot_config.foot_body_name in name
+        ]
+        foot_indices: dict[str, int] = {}
+        for side in ("right", "left"):
+            match = next((idx for idx, name in candidates if side in name.lower()), None)
+            if match is None:
+                raise ValueError(
+                    f"Could not resolve the {side} foot body using "
+                    f"foot_body_name='{env.robot_config.foot_body_name}'."
+                )
+            foot_indices[side] = match
+        return foot_indices
+
+    def _foot_ground_reaction_wrench(self, env_idx: int, side: str) -> np.ndarray:
+        """Return the simulator foot contact force as a 6D wrench for the WBC binding."""
+        force = (
+            self.env.simulator.contact_forces[env_idx, self._foot_body_indices[side]]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        wrench = np.zeros(6, dtype=float)
+        wrench[:3] = force
+        return wrench
 
     def _attach_actuator_randomizer_scales(self) -> None:
         """Attach shared actuator randomizer buffers if they exist."""
@@ -590,8 +661,9 @@ class JointTorqueActionTerm(ActionTermBase):
             self._try_add_local_extension_path(module_name, extension_dir)
             return importlib.import_module(module_name)
 
-    def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any]):
-        wbc_module = self._import_wbc_module(extension_dir)
+    def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any], wbc_module: Any | None = None):
+        if wbc_module is None:
+            wbc_module = self._import_wbc_module(extension_dir)
         extension_root = self._extension_root(extension_dir)
         robot_file = Path(params.get("robot_file", extension_root / "models" / "hrp4c" / "HRP4c.urdf"))
         yaml_file = Path(params.get("yaml_file", extension_root / "params" / "hrp4c_parameters.yaml"))
