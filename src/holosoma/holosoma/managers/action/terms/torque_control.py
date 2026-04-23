@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 from holosoma.managers.action.base import ActionTermBase
+from holosoma.utils.rotations import quat_apply, quaternion_to_matrix
 
 if TYPE_CHECKING:
     from holosoma.config_types.action import ActionTermCfg
@@ -64,6 +66,27 @@ def axis_angle_to_matrix(axis_angle: np.ndarray) -> np.ndarray:
         dtype=float,
     )
     return np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
+
+
+def matrix_to_urdf_floating_xyz_angles(rotation: torch.Tensor) -> torch.Tensor:
+    """Extract angles for a URDF chain R = Rx(rx) @ Ry(ry) @ Rz(rz)."""
+    sy = torch.clamp(rotation[..., 0, 2], -1.0, 1.0)
+    ry = torch.asin(sy)
+    rx = torch.atan2(-rotation[..., 1, 2], rotation[..., 2, 2])
+    rz = torch.atan2(-rotation[..., 0, 1], rotation[..., 0, 0])
+    return torch.stack([rx, ry, rz], dim=-1)
+
+
+def root_state_to_xyz_rpy(root_state: torch.Tensor) -> torch.Tensor:
+    """Convert root [xyz, quat_xyzw, v, w] to [xyz, rx, ry, rz] for the control URDF floating joints."""
+    root_rotation = quaternion_to_matrix(root_state[3:7].unsqueeze(0), w_last=True)[0]
+    rx_ry_rz = matrix_to_urdf_floating_xyz_angles(root_rotation)
+    return torch.cat([root_state[0:3], rx_ry_rz], dim=0)
+
+
+def root_state_to_base_velocity(root_state: torch.Tensor) -> torch.Tensor:
+    """Return floating-base velocity as [linear_velocity, angular_velocity]."""
+    return root_state[7:13]
 
 def parse_actions(actions: torch.Tensor) -> dict:
     """
@@ -179,6 +202,9 @@ class JointTorqueActionTerm(ActionTermBase):
         self.action_queue: torch.Tensor | None = None
 
         self._foot_body_indices = self._resolve_foot_body_indices(env)
+        self._last_wbc_q = torch.zeros(env.num_envs, env.num_dof + 6, device=env.device)
+        self._last_wbc_root_state = torch.zeros(env.num_envs, 13, device=env.device)
+        self._last_wbc_dof_pos = torch.zeros(env.num_envs, env.num_dof, device=env.device)
         self._wbc_module = self._import_wbc_module(cfg.wbc_extension_dir)
         self.State = self._wbc_module.State
         self.Phase = self._wbc_module.Phase
@@ -327,8 +353,14 @@ class JointTorqueActionTerm(ActionTermBase):
         action_scale = float(self.env.robot_config.control.action_scale)
 
         for env_idx in range(num_envs):
-            q = self.env.simulator.dof_pos[env_idx].detach().cpu().numpy()
-            dq = self.env.simulator.dof_vel[env_idx].detach().cpu().numpy()
+            root_state = self.env.simulator.robot_root_states[env_idx]
+            q_tensor = torch.cat([root_state_to_xyz_rpy(root_state), self.env.simulator.dof_pos[env_idx]], dim=0)
+            dq_tensor = torch.cat([root_state_to_base_velocity(root_state), self.env.simulator.dof_vel[env_idx]], dim=0)
+            q = q_tensor.detach().cpu().numpy()
+            dq = dq_tensor.detach().cpu().numpy()
+            self._last_wbc_q[env_idx] = q_tensor
+            self._last_wbc_root_state[env_idx] = root_state
+            self._last_wbc_dof_pos[env_idx] = self.env.simulator.dof_pos[env_idx]
             self.wbc[env_idx].updateRobot(q, dq)
 
             # Get contact state from control from humanoid
@@ -347,6 +379,7 @@ class JointTorqueActionTerm(ActionTermBase):
             #     self.wbc[env_idx].reInitializeTask(curr_state)
             #     self._prev_wbc_state = curr_state
 
+            # Revised contact state information and logic
             right_contact_point = self.env.simulator.right_foot_contact_position[env_idx].detach().cpu().numpy()
             left_contact_point = self.env.simulator.left_foot_contact_position[env_idx].detach().cpu().numpy()
             right_contact_basis = np.diag(
@@ -358,6 +391,10 @@ class JointTorqueActionTerm(ActionTermBase):
             right_foot_grf = self._foot_ground_reaction_wrench(env_idx, "right")
             left_foot_grf = self._foot_ground_reaction_wrench(env_idx, "left")
 
+            # # debug force basis
+            # right_contact_basis = np.eye(3)
+            # left_contact_basis = np.eye(3)
+
             # Update stance support from contact information
             self.wbc[env_idx].updateStanceSupport(
                 self.State.NUM_STATES,
@@ -365,6 +402,16 @@ class JointTorqueActionTerm(ActionTermBase):
                 right_contact_basis,
                 left_contact_point,
                 left_contact_basis,
+            )
+
+            self._draw_stance_support(
+                env_idx,
+                right_contact_point,
+                right_contact_basis,
+                "right",
+                left_contact_point,
+                left_contact_basis,
+                "left",
             )
 
             # Query the stance switching logic
@@ -380,26 +427,38 @@ class JointTorqueActionTerm(ActionTermBase):
                     left_foot_grf,
                 )
 
+            # Debug: force dual stance 
+            self.curr_state[env_idx] = self.State.DUAL_STANCE
+
             # Get current pose
-            com_pose = np.asarray(self.wbc[env_idx].getPose("com"), dtype=float)
+            com_pose = np.asarray(self.wbc[env_idx].getPose("com"), dtype=float) # matrix
             torso_pose = np.asarray(self.wbc[env_idx].getPose("torso"), dtype=float)
+            pelvis_rotation = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)            
             right_foot_pose = np.asarray(self.wbc[env_idx].getPose("right_foot"), dtype=float)
             left_foot_pose = np.asarray(self.wbc[env_idx].getPose("left_foot"), dtype=float)
-            pelvis_rotation = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)
 
-            # Get actions 
+            # Get actions and set targets
             action_dict = parse_actions(actions[env_idx] * action_scale)
+            targets = self._wbc_module.WbcDesiredTargets()
+
+            # debug
+            print(action_dict)
+
             com_pos = action_dict["com_pos"].detach().cpu().numpy() + com_pose[:3, 3]
             pelvis_ori = axis_angle_to_matrix(action_dict["pelvis_ori"].detach().cpu().numpy()) @ pelvis_rotation
             torso_ori = torso_pose[:3, :3]
             right_foot_pos = action_dict["right_foot_pos"].detach().cpu().numpy() + right_foot_pose[:3, 3]
-            right_foot_ori = (
-                axis_angle_to_matrix(action_dict["right_foot_ori"].detach().cpu().numpy()) @ right_foot_pose[:3, :3]
-            )
+            right_foot_ori = axis_angle_to_matrix(action_dict["right_foot_ori"].detach().cpu().numpy()) @ right_foot_pose[:3, :3]
             left_foot_pos = action_dict["left_foot_pos"].detach().cpu().numpy() + left_foot_pose[:3, 3]
-            left_foot_ori = (
-                axis_angle_to_matrix(action_dict["left_foot_ori"].detach().cpu().numpy()) @ left_foot_pose[:3, :3]
-            )
+            left_foot_ori = axis_angle_to_matrix(action_dict["left_foot_ori"].detach().cpu().numpy()) @ left_foot_pose[:3, :3]
+
+            targets.com.position = com_pos
+            targets.pelvis.orientation = pelvis_ori
+            targets.torso.orientation = torso_ori
+            targets.right_foot.position = right_foot_pos
+            targets.right_foot.orientation = right_foot_ori
+            targets.left_foot.position = left_foot_pos
+            targets.left_foot.orientation = left_foot_ori
 
             # Compute torques
             # Stance transition torques
@@ -407,30 +466,23 @@ class JointTorqueActionTerm(ActionTermBase):
             if self.curr_state[env_idx] not in (self.State.DUAL_STANCE, self.State.LEFT_STANCE, self.State.RIGHT_STANCE):
                 normalized_time = (sim_time - self.transition_start_time[env_idx]) / self.wbc[env_idx].getTotalTransitionTime()
                 normalized_time = min(max(normalized_time, 0.0), 1.0)
-                transition_done, torque_wbc = self.wbc[env_idx].computeContactTransferOutput(self._wbc_module.getPhaseFromState(int(self.curr_state[env_idx])), normalized_time)
-                torque_np = np.asarray(torque_wbc, dtype=float).reshape(-1)
+                transition_done, torque_wbc = self.wbc[env_idx].computeContactTransferOutput(self._wbc_module.getPhaseFromState(self.curr_state[env_idx]), normalized_time)
+                torque_np = self._actuated_torques_from_wbc_output(torque_wbc)
                 if transition_done:
                     # Transition to next state
                     self.curr_state[env_idx] = self._wbc_module.getNextStateFromTransition(self.curr_state[env_idx])
             else:
                 self.transition_start_time[env_idx] = sim_time
-                torque_np = np.asarray(
+                torque_np = self._actuated_torques_from_wbc_output(
                     self.wbc[env_idx].compute(
                         self.curr_state[env_idx],
-                        com_pos,
-                        pelvis_ori,
-                        torso_ori,
-                        right_foot_pos,
-                        right_foot_ori,
-                        left_foot_pos,
-                        left_foot_ori,
-                    ),
-                    dtype=float,
-                ).reshape(-1)
+                        targets
+                    )
+                )
 
             torques[env_idx] = torch.as_tensor(torque_np, device=actions.device, dtype=self.torques.dtype)
 
-        # # Scale actions
+        # Scale actions
         # actions_scaled = actions * self.action_scales
 
         # # Compute torques based on control type
@@ -454,18 +506,216 @@ class JointTorqueActionTerm(ActionTermBase):
         # else:
         #     raise ValueError(f"Unknown controller type: {control_type}")
 
-        # # Apply torque randomization if configured
-        # if self._randomize_torque_rfi:
-        #     torques = (
-        #         torques
-        #         + (torch.rand_like(torques) * 2.0 - 1.0) * self._rfi_lim * self._rfi_lim_scale * self.env.torque_limits
-        #     )
+        # Apply torque randomization if configured
+        if self._randomize_torque_rfi:
+            torques = (
+                torques
+                + (torch.rand_like(torques) * 2.0 - 1.0) * self._rfi_lim * self._rfi_lim_scale * self.env.torque_limits
+            )
 
         # Clip torques if configured
         if self.env.robot_config.control.clip_torques:
             torques = torch.clip(torques, -self.env.torque_limits, self.env.torque_limits)
 
         return torques
+
+    def _actuated_torques_from_wbc_output(self, torque_wbc: Any) -> np.ndarray:
+        """Normalize WBC torque output to simulator actuated DOF torques."""
+        torque_np = np.asarray(torque_wbc, dtype=float).reshape(-1)
+        if torque_np.shape[0] == self._action_dim:
+            return torque_np
+        if torque_np.shape[0] == self._action_dim + 6:
+            return torque_np[6:]
+        raise RuntimeError(
+            "Unexpected WBC torque output size: "
+            f"got {torque_np.shape[0]}, expected {self._action_dim} actuated torques "
+            f"or {self._action_dim + 6} floating-base torques."
+        )
+
+    def _draw_stance_support(
+        self,
+        env_idx: int,
+        right_contact_point: np.ndarray,
+        right_contact_basis: np.ndarray,
+        right_side: str,
+        left_contact_point: np.ndarray,
+        left_contact_basis: np.ndarray,
+        left_side: str,
+    ) -> None:
+        simulator = self.env.simulator
+        if not hasattr(simulator, "draw_sphere"):
+            return
+
+        self._draw_contact_support_frame(
+            env_idx,
+            np.asarray(right_contact_point, dtype=float),
+            np.asarray(right_contact_basis, dtype=float),
+            right_side,
+            point_color=[1.0, 0.25, 0.1],
+            pos_id_base=100,
+        )
+        self._draw_contact_support_frame(
+            env_idx,
+            np.asarray(left_contact_point, dtype=float),
+            np.asarray(left_contact_basis, dtype=float),
+            left_side,
+            point_color=[0.2, 0.45, 1.0],
+            pos_id_base=200,
+        )
+
+    def _draw_contact_support_frame(
+        self,
+        env_idx: int,
+        contact_point: np.ndarray,
+        contact_basis: np.ndarray,
+        side: str,
+        point_color: list[float],
+        pos_id_base: int,
+    ) -> None:
+        if contact_point.shape[0] < 3 or contact_basis.shape != (3, 3):
+            return
+        if not np.all(np.isfinite(contact_point)) or not np.all(np.isfinite(contact_basis)):
+            return
+        
+        print("local contact point: ", contact_point)
+
+        simulator = self.env.simulator
+        foot_body_idx = self._foot_body_indices[side]
+
+        # hard-code
+        if side == 'right':
+            foot_body_idx = 14
+        elif side == 'left':
+            foot_body_idx = 7
+
+        print('foot body idx: ', foot_body_idx)
+        
+        foot_pos_w = simulator._rigid_body_pos[env_idx, foot_body_idx]
+        foot_quat_w = simulator._rigid_body_rot[env_idx, foot_body_idx]
+        self._assert_foot_pose_matches_wbc(env_idx, side, foot_pos_w, foot_quat_w)
+
+        local_contact_point = torch.as_tensor(contact_point[:3], device=foot_pos_w.device, dtype=foot_pos_w.dtype)
+        world_contact_point_tensor = foot_pos_w + quat_apply(foot_quat_w, local_contact_point, w_last=True)
+        world_contact_point = world_contact_point_tensor.detach().cpu().numpy()
+
+        point = torch.as_tensor(world_contact_point, dtype=torch.float32).cpu()
+        simulator.draw_sphere(point, 0.018, point_color, env_id=env_idx, pos_id=pos_id_base)
+
+        if not hasattr(simulator, "draw_line"):
+            return
+
+        axis_colors = ([1.0, 0.0, 0.0], [0.0, 0.85, 0.0], [0.1, 0.25, 1.0])
+        axis_scale = 0.12
+        for axis_idx, axis_color in enumerate(axis_colors):
+            local_axis = torch.as_tensor(
+                contact_basis[:, axis_idx], device=foot_quat_w.device, dtype=foot_quat_w.dtype
+            )
+            axis = quat_apply(foot_quat_w, local_axis, w_last=True).detach().cpu().numpy()
+            axis_norm = float(np.linalg.norm(axis))
+            if axis_norm < 1.0e-9:
+                continue
+            end = torch.as_tensor(world_contact_point + axis_scale * axis / axis_norm, dtype=torch.float32).cpu()
+            simulator.draw_line(point, end, axis_color, env_id=env_idx)
+
+    def _assert_foot_pose_matches_wbc(
+        self,
+        env_idx: int,
+        side: str,
+        foot_pos_w: torch.Tensor,
+        foot_quat_w: torch.Tensor
+    ) -> None:
+        # foot_name = f"{side}_foot"
+        foot_name = f"{side}_ankle_roll_link"
+        wbc_pos = np.asarray(self.wbc[env_idx].getPosition(foot_name, np.array([0, 0, 0])), dtype=float).reshape(-1)
+        wbc_rot = np.asarray(self.wbc[env_idx].getRotation(foot_name), dtype=float)
+        if wbc_pos.shape[0] < 3 or not np.all(np.isfinite(wbc_pos)):
+            raise AssertionError(f"WBC {foot_name} position is invalid: shape={wbc_pos.shape}, pos={wbc_pos}")
+        if wbc_rot.shape != (3, 3) or not np.all(np.isfinite(wbc_rot)):
+            raise AssertionError(f"WBC {foot_name} rotation is invalid: shape={wbc_rot.shape}, rotation={wbc_rot}")
+        wbc_pelvis_pos = np.asarray(self.wbc[env_idx].getPosition("pelvis"), dtype=float).reshape(-1)
+        wbc_pelvis_rot = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)
+        if wbc_pelvis_pos.shape[0] < 3 or not np.all(np.isfinite(wbc_pelvis_pos)):
+            raise AssertionError(f"WBC pelvis position is invalid: shape={wbc_pelvis_pos.shape}, pos={wbc_pelvis_pos}")
+        if wbc_pelvis_rot.shape != (3, 3) or not np.all(np.isfinite(wbc_pelvis_rot)):
+            raise AssertionError(
+                f"WBC pelvis rotation is invalid: shape={wbc_pelvis_rot.shape}, rotation={wbc_pelvis_rot}"
+            )
+
+        sim_pos = foot_pos_w.detach().cpu().numpy()
+        sim_rot = quaternion_to_matrix(foot_quat_w.unsqueeze(0), w_last=True)[0].detach().cpu().numpy()
+        wbc_pos = wbc_pos[:3]
+        self._print_foot_frame_inspection(env_idx, side, sim_pos, wbc_pos)
+
+        root_state = self.env.simulator.robot_root_states[env_idx]
+        dof_pos = self.env.simulator.dof_pos[env_idx]
+        pelvis_pos = root_state[:3].detach().cpu().numpy()
+        pelvis_rot = quaternion_to_matrix(root_state[3:7].unsqueeze(0), w_last=True)[0].detach().cpu().numpy()
+        wbc_pelvis_pos = wbc_pelvis_pos[:3]
+        q_tensor = torch.cat([root_state_to_xyz_rpy(root_state), dof_pos], dim=0)
+        q_error = float(torch.linalg.vector_norm(q_tensor - self._last_wbc_q[env_idx]).item())
+        root_state_error = float(
+            torch.linalg.vector_norm(root_state - self._last_wbc_root_state[env_idx]).item()
+        )
+        dof_pos_error = float(torch.linalg.vector_norm(dof_pos - self._last_wbc_dof_pos[env_idx]).item())
+        pos_delta = sim_pos - wbc_pos
+        pelvis_pos_delta = pelvis_pos - wbc_pelvis_pos
+        pos_error = float(np.linalg.norm(sim_pos - wbc_pos))
+        rot_error = float(np.linalg.norm(sim_rot - wbc_rot, ord="fro"))
+        pelvis_pos_error = float(np.linalg.norm(pelvis_pos - wbc_pelvis_pos))
+        pelvis_rot_error = float(np.linalg.norm(pelvis_rot - wbc_pelvis_rot, ord="fro"))
+        assert (
+            q_error < 1.0e-6
+            and root_state_error < 1.0e-6
+            and dof_pos_error < 1.0e-6
+            and pelvis_pos_error < 1.0e-3
+            and pelvis_rot_error < 1.0e-3
+            and pos_error < 1.0e-3
+            and rot_error < 1.0e-2
+        ), (
+            f"Simulator {side} foot pose does not match WBC {side}_foot pose: "
+            f"q_error={q_error:.9f}, root_state_error={root_state_error:.9f}, "
+            f"dof_pos_error={dof_pos_error:.9f}, pelvis_pos_error={pelvis_pos_error:.9f}, "
+            f"pelvis_rot_error={pelvis_rot_error:.9f}, pos_error={pos_error:.9f}, rot_error={rot_error:.9f}, "
+            f"pelvis_sim_pos_xyz={pelvis_pos.tolist()}, pelvis_wbc_pos_xyz={wbc_pelvis_pos.tolist()}, "
+            f"pelvis_pos_delta_xyz={pelvis_pos_delta.tolist()}, "
+            f"sim_pos_xyz={sim_pos.tolist()}, wbc_pos_xyz={wbc_pos.tolist()}, pos_delta_xyz={pos_delta.tolist()}"
+        )
+
+    def _print_foot_frame_inspection(
+        self,
+        env_idx: int,
+        side: str,
+        resolved_sim_pos: np.ndarray,
+        wbc_compare_pos: np.ndarray,
+    ) -> None:
+        simulator = self.env.simulator
+        resolved_idx = self._foot_body_indices[side]
+        body_names = list(getattr(simulator, "body_names", []))
+        resolved_name = body_names[resolved_idx] if 0 <= resolved_idx < len(body_names) else "<out-of-range>"
+
+        print(
+            "foot_frame_inspection:"
+            f" side={side}"
+            f" resolved_idx={resolved_idx}"
+            f" resolved_name={resolved_name}"
+            f" robot_config.foot_body_name={self.env.robot_config.foot_body_name}"
+            f" resolved_sim_pos={resolved_sim_pos.tolist()}"
+            f" wbc_compare_pos={wbc_compare_pos.tolist()}"
+            f" delta={list((resolved_sim_pos - wbc_compare_pos).tolist())}"
+        )
+
+        for suffix in ("ankle_pitch_link", "ankle_roll_link", "foot"):
+            frame_name = f"{side}_{suffix}"
+            sim_matches = [(idx, name) for idx, name in enumerate(body_names) if name == frame_name]
+            for sim_idx, sim_name in sim_matches:
+                sim_pos = simulator._rigid_body_pos[env_idx, sim_idx].detach().cpu().numpy()
+                print(f"  sim_frame name={sim_name} idx={sim_idx} pos={sim_pos.tolist()}")
+
+            try:
+                wbc_pos = np.asarray(self.wbc[env_idx].getPosition(frame_name), dtype=float).reshape(-1)[:3]
+                print(f"  wbc_frame name={frame_name} pos={wbc_pos.tolist()}")
+            except Exception as exc:
+                print(f"  wbc_frame name={frame_name} unavailable={exc}")
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         """Reset action term state.
@@ -476,7 +726,7 @@ class JointTorqueActionTerm(ActionTermBase):
         super().reset(env_ids)
 
         # Reset action delay queue if applicable
-        if self.env._randomize_ctrl_delay and self.action_queue is not None:
+        if getattr(self.env, "_randomize_ctrl_delay", False) and self.action_queue is not None:
             if env_ids is None:
                 self.action_queue.zero_()
             else:
@@ -537,18 +787,28 @@ class JointTorqueActionTerm(ActionTermBase):
 
     def _resolve_foot_body_indices(self, env: Any) -> dict[str, int]:
         """Resolve simulator body indices used to read per-foot ground reaction forces."""
-        simulator_indices = getattr(env.simulator, "_foot_body_indices", None)
-        if simulator_indices is not None:
-            return {"right": int(simulator_indices["right"]), "left": int(simulator_indices["left"])}
-
-        candidates = [
-            (idx, name)
-            for idx, name in enumerate(env.simulator.body_names)
-            if env.robot_config.foot_body_name in name
-        ]
         foot_indices: dict[str, int] = {}
         for side in ("right", "left"):
-            match = next((idx for idx, name in candidates if side in name.lower()), None)
+            exact_name = f"{side}_{env.robot_config.foot_body_name}"
+            match = next((idx for idx, name in enumerate(env.simulator.body_names) if name == exact_name), None)
+            if match is None:
+                match = next(
+                    (
+                        idx
+                        for idx, name in enumerate(env.simulator.body_names)
+                        if side in name.lower() and name.endswith(env.robot_config.foot_body_name)
+                    ),
+                    None,
+                )
+            if match is None:
+                match = next(
+                    (
+                        idx
+                        for idx, name in enumerate(env.simulator.body_names)
+                        if side in name.lower() and env.robot_config.foot_body_name in name
+                    ),
+                    None,
+                )
             if match is None:
                 raise ValueError(
                     f"Could not resolve the {side} foot body using "
@@ -625,10 +885,10 @@ class JointTorqueActionTerm(ActionTermBase):
             self.action_scales[:] = control_cfg.action_scale
 
     # WBC import helpers
-    def _repo_root() -> Path:
+    def _repo_root(self) -> Path:
         return Path(__file__).resolve().parents[1]
 
-    def _extension_root(extension_dir: str | None = None) -> Path:
+    def _extension_root(self, extension_dir: str | None = None) -> Path:
         if extension_dir:
             resolved = Path(extension_dir).expanduser().resolve()
             if resolved.name == "build":
@@ -636,30 +896,47 @@ class JointTorqueActionTerm(ActionTermBase):
             return resolved
         return self._repo_root()
 
-    def _try_add_local_extension_path(module_name: str, extension_dir: str | None = None) -> None:
+    def _try_add_local_extension_path(self, module_name: str, extension_dir: str | None = None) -> None:
+        for candidate in self._find_wbc_extension_candidates(module_name, extension_dir):
+            module_dir = str(candidate.parent)
+            if module_dir not in sys.path:
+                sys.path.insert(0, module_dir)
+            return
+
+    def _find_wbc_extension_candidates(self, module_name: str, extension_dir: str | None = None) -> list[Path]:
         search_roots = []
         if extension_dir:
             search_roots.append(Path(extension_dir).expanduser().resolve())
         search_roots.extend([self._repo_root() / "build", self._repo_root()])
 
+        candidates: list[Path] = []
         for base in search_roots:
             if not base.exists():
                 continue
             for pattern in (f"{module_name}*.so", f"{module_name}*.pyd", f"{module_name}*.dylib"):
-                for candidate in base.rglob(pattern):
-                    module_dir = str(candidate.parent)
-                    if module_dir not in sys.path:
-                        sys.path.insert(0, module_dir)
-                    return
+                candidates.extend(base.rglob(pattern))
+        return candidates
 
 
-    def _import_wbc_module(extension_dir: str | None = None):
+    def _import_wbc_module(self, extension_dir: str | None = None):
         module_name = "humanoid_wbc"
         try:
             return importlib.import_module(module_name)
         except Exception:
             self._try_add_local_extension_path(module_name, extension_dir)
-            return importlib.import_module(module_name)
+            try:
+                return importlib.import_module(module_name)
+            except Exception as fallback_error:
+                candidates = self._find_wbc_extension_candidates(module_name, extension_dir)
+                supported_suffixes = importlib.machinery.EXTENSION_SUFFIXES
+                candidate_text = ", ".join(str(candidate) for candidate in candidates) or "none"
+                raise ModuleNotFoundError(
+                    "Could not import humanoid_wbc. "
+                    f"Searched extension_dir={extension_dir!r}; found candidates: {candidate_text}. "
+                    f"This Python accepts extension suffixes: {supported_suffixes}. "
+                    "If a candidate is tagged for another Python version, rebuild humanoid-control "
+                    "inside the active Python environment."
+                ) from fallback_error
 
     def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any], wbc_module: Any | None = None):
         if wbc_module is None:

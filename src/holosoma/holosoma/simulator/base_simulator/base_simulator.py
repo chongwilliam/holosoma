@@ -209,12 +209,28 @@ class BaseSimulator:
 
     def _find_foot_body_indices(self) -> dict[str, int]:
         """Resolve left/right foot body indices from configured body names."""
-        candidates = [
-            (idx, name) for idx, name in enumerate(self.body_names) if self.robot_config.foot_body_name in name
-        ]
         foot_indices: dict[str, int] = {}
         for side in ("right", "left"):
-            match = next((idx for idx, name in candidates if side in name.lower()), None)
+            exact_name = f"{side}_{self.robot_config.foot_body_name}"
+            match = next((idx for idx, name in enumerate(self.body_names) if name == exact_name), None)
+            if match is None:
+                match = next(
+                    (
+                        idx
+                        for idx, name in enumerate(self.body_names)
+                        if side in name.lower() and name.endswith(self.robot_config.foot_body_name)
+                    ),
+                    None,
+                )
+            if match is None:
+                match = next(
+                    (
+                        idx
+                        for idx, name in enumerate(self.body_names)
+                        if side in name.lower() and self.robot_config.foot_body_name in name
+                    ),
+                    None,
+                )
             if match is None:
                 raise ValueError(
                     f"Could not resolve the {side} foot body using foot_body_name='{self.robot_config.foot_body_name}'."

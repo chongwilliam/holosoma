@@ -855,7 +855,6 @@ class IsaacSim(BaseSimulator):
 
         self._clear_foot_contact_buffers()
 
-        foot_center = torch.tensor(self.robot_config.foot_center, device=self.device, dtype=torch.float32)
         foot_sensors = {
             "right": self.right_foot_contact_sensor,
             "left": self.left_foot_contact_sensor,
@@ -876,14 +875,11 @@ class IsaacSim(BaseSimulator):
                 body_quat_w = self._robot.data.body_quat_w[env_id, self.body_ids][body_id][[1, 2, 3, 0]]
                 body_quat_inv = quat_inverse(body_quat_w, w_last=True).unsqueeze(0).repeat(valid_points_w.shape[0], 1)
                 body_pos_w = self._robot.data.body_pos_w[env_id, self.body_ids, :][body_id]
-                local_contact_points = foot_center.unsqueeze(0) + quat_apply(
+                local_contact_points = quat_apply(
                     body_quat_inv,
                     valid_points_w - body_pos_w.unsqueeze(0),
                     w_last=True,
                 )
-
-                # debug
-                print(sensor_contact_points)
 
                 barycenter, support_axes = self._summarize_local_foot_contacts(local_contact_points)
                 if side == "right":

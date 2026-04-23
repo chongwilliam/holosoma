@@ -857,6 +857,7 @@ class MuJoCo(BaseSimulator):
                     "Warp backend will report zeros."
                 )
                 self._mujoco_contact_support_warning_emitted = True
+                exit(0)
             return
 
         assert self.root_model
@@ -877,7 +878,6 @@ class MuJoCo(BaseSimulator):
                         )
                         break
 
-        foot_center = torch.tensor(self.robot_config.foot_center, device=self.sim_device, dtype=torch.float32)
         for side, world_points in foot_world_points.items():
             if not world_points:
                 continue
@@ -887,7 +887,7 @@ class MuJoCo(BaseSimulator):
             foot_quat_w = self._rigid_body_rot[0, foot_body_idx]
             foot_quat_inv = quat_inverse(foot_quat_w, w_last=True).unsqueeze(0).repeat(points_w.shape[0], 1)
             foot_pos_w = self._rigid_body_pos[0, foot_body_idx]
-            local_contact_points = foot_center.unsqueeze(0) + quat_apply(
+            local_contact_points = quat_apply(
                 foot_quat_inv,
                 points_w - foot_pos_w.unsqueeze(0),
                 w_last=True,
@@ -1293,8 +1293,16 @@ class MuJoCo(BaseSimulator):
             logger.info("No robot DOFs available - skipping DOF state update")
             return
 
-        assert dof_states
-        if dof_states.dim() != 2 and dof_states.shape[0] != len(env_ids) * self.num_dof:
+        if dof_states is None:
+            raise ValueError("dof_states must be provided or available on the simulator.")
+        if dof_states.dim() == 3:
+            if dof_states.shape != (len(env_ids), self.num_dof, 2):
+                raise ValueError(
+                    f"Unsupported dof_states tensor format: {dof_states.shape}. "
+                    f"Expected [num_envs, num_dofs, 2] or [num_envs * num_dofs, 2]"
+                )
+            dof_states = dof_states.reshape(len(env_ids) * self.num_dof, 2)
+        elif dof_states.dim() != 2 or dof_states.shape != (len(env_ids) * self.num_dof, 2):
             raise ValueError(
                 f"Unsupported dof_states tensor format: {dof_states.shape}. "
                 f"Expected [num_envs, num_dofs, 2] or [num_envs * num_dofs, 2]"
