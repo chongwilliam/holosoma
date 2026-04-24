@@ -152,6 +152,8 @@ class WarpBackend(IMujocoBackend):
 
         # Keep reference to CPU data for rendering (synced on demand)
         self.render_data = data
+        self._mujoco_to_holosoma_body_map: dict[int, int] = {}
+        self._force_tensor = torch.zeros(self.num_envs, model.nbody, 6, device=device)
 
         # Capture simulation step as CUDA graph for optimal performance
         # This eliminates per-kernel launch overhead (~20-30 kernels per step)
@@ -166,6 +168,10 @@ class WarpBackend(IMujocoBackend):
         logger.info(
             f"WarpBackend initialized: {model.nbody} bodies, {model.nq} qpos, {model.nv} qvel, {model.nu} actuators"
         )
+
+    def set_contact_body_index_map(self, mujoco_to_holosoma_body_map: dict[int, int]) -> None:
+        """Store MuJoCo-to-holosoma body index mapping for contact remapping."""
+        self._mujoco_to_holosoma_body_map = dict(mujoco_to_holosoma_body_map)
 
     def initialize_state(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Initialize GPU state from CPU data after construction.
@@ -278,14 +284,14 @@ class WarpBackend(IMujocoBackend):
         Parameters
         ----------
         contact_history_tensor : torch.Tensor
-            Contact force history buffer [num_envs, history_len, num_bodies, 3]
+            Contact wrench history buffer [num_envs, history_len, num_bodies, 6]
         """
-        # cfrc_ext is already computed by Warp: [num_envs, num_bodies, 6]
-        # Take first 3 components (forces, ignore torques)
-        forces = self.cfrc_t[..., :3]  # [num_envs, num_bodies, 3]
+        self._force_tensor.zero_()
+        for mujoco_body_id, holosoma_body_idx in self._mujoco_to_holosoma_body_map.items():
+            self._force_tensor[:, holosoma_body_idx] = self.cfrc_t[:, mujoco_body_id]
 
         # Update history: shift old values right, add current at position 0
-        contact_history_tensor[:] = torch.cat([forces.unsqueeze(1), contact_history_tensor[:, :-1]], dim=1)
+        contact_history_tensor[:] = torch.cat([self._force_tensor.unsqueeze(1), contact_history_tensor[:, :-1]], dim=1)
 
     def create_root_view(self, addrs: dict) -> BaseMujocoView:
         """Create root state view using zero-copy tensors.
@@ -394,10 +400,9 @@ class WarpBackend(IMujocoBackend):
         Returns
         -------
         torch.Tensor
-            Contact forces [num_envs, num_bodies, 3] - native PyTorch tensor
+            Contact wrenches [num_envs, num_bodies, 6] - native PyTorch tensor
         """
-        # cfrc_ext is [num_envs, num_bodies, 6], take first 3 components (forces only)
-        return self.cfrc_t[..., :3]
+        return self._force_tensor
 
     def create_dof_state_view(self, dof_addrs: dict, num_dof: int) -> BaseMujocoView:
         """Create DOF state view using zero-copy GPU tensors.

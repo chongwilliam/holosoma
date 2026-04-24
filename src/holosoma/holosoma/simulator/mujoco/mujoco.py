@@ -134,6 +134,7 @@ class MuJoCo(BaseSimulator):
         # Mujoco.
         self.clean_to_prefixed_names: dict[str, str] = {}  # "hip_joint" -> "robot_hip_joint"
         self.prefixed_to_clean_names: dict[str, str] = {}  # "robot_hip_joint" -> "hip_joint"
+        self._foot_force_sensor_cache: dict[str, dict[str, int]] = {}
 
         # Minimal state tensors (placeholders)
         self.dof_pos = torch.zeros(0, device=device)
@@ -203,6 +204,7 @@ class MuJoCo(BaseSimulator):
         bodies in the contact force tensor.
         """
         self.mujoco_to_holosoma_body_map: dict[int, int] = {}
+        self.holosoma_to_mujoco_body_map: dict[int, int] = {}
 
         logger.info("=== Building MuJoCo body ID to holosoma index mapping ===")
 
@@ -213,6 +215,7 @@ class MuJoCo(BaseSimulator):
             mujoco_body_id = mujoco.mj_name2id(self.root_model, mujoco.mjtObj.mjOBJ_BODY, prefixed_name)
             if mujoco_body_id != -1:
                 self.mujoco_to_holosoma_body_map[mujoco_body_id] = holosoma_idx
+                self.holosoma_to_mujoco_body_map[holosoma_idx] = mujoco_body_id
                 logger.info(
                     f"Body mapping: '{body_name}' -> '{prefixed_name}' | MuJoCo ID {mujoco_body_id} -> "
                     f"holosoma idx {holosoma_idx}"
@@ -251,6 +254,49 @@ class MuJoCo(BaseSimulator):
             Clean name for holosoma use, or original name if not found.
         """
         return self.prefixed_to_clean_names.get(prefixed_name, prefixed_name)
+
+    def _lookup_mujoco_named_id(self, obj_type: mujoco.mjtObj, name: str) -> int:
+        """Resolve a MuJoCo object id, trying both clean and robot-prefixed names."""
+        assert self.root_model
+
+        object_id = mujoco.mj_name2id(self.root_model, obj_type, name)
+        if object_id != -1:
+            return object_id
+
+        prefixed_name = f"{self.scene_manager.robot_prefix}{name}"
+        object_id = mujoco.mj_name2id(self.root_model, obj_type, prefixed_name)
+        return object_id
+
+    def _get_foot_force_sensor_metadata(self, side: str) -> dict[str, int]:
+        """Resolve and cache sensor/site ids for a foot force-torque sensor."""
+        cached = self._foot_force_sensor_cache.get(side)
+        if cached is not None:
+            return cached
+
+        force_sensor_name = f"{side}_ankle_roll_force"
+        torque_sensor_name = f"{side}_ankle_roll_torque"
+        site_name = f"{side}_ankle_roll_force_site"
+
+        force_sensor_id = self._lookup_mujoco_named_id(mujoco.mjtObj.mjOBJ_SENSOR, force_sensor_name)
+        torque_sensor_id = self._lookup_mujoco_named_id(mujoco.mjtObj.mjOBJ_SENSOR, torque_sensor_name)
+        site_id = self._lookup_mujoco_named_id(mujoco.mjtObj.mjOBJ_SITE, site_name)
+
+        if force_sensor_id == -1 or torque_sensor_id == -1 or site_id == -1:
+            raise KeyError(
+                f"Missing MuJoCo foot force sensor metadata for side='{side}': "
+                f"force_sensor_id={force_sensor_id}, torque_sensor_id={torque_sensor_id}, site_id={site_id}"
+            )
+
+        assert self.root_model
+        metadata = {
+            "force_sensor_id": force_sensor_id,
+            "torque_sensor_id": torque_sensor_id,
+            "site_id": site_id,
+            "force_adr": int(self.root_model.sensor_adr[force_sensor_id]),
+            "torque_adr": int(self.root_model.sensor_adr[torque_sensor_id]),
+        }
+        self._foot_force_sensor_cache[side] = metadata
+        return metadata
 
     def set_headless(self, headless: bool) -> None:
         """Set headless mode for the simulator.
@@ -438,6 +484,7 @@ class MuJoCo(BaseSimulator):
 
         # Build body index mapping for contact forces (after body_names is defined)
         self._build_body_index_mapping()
+        self.backend.set_contact_body_index_map(self.mujoco_to_holosoma_body_map)
 
         # Add _body_list attribute for compatibility with whole_body_tracking environment
         # Needs to be encapsulated and added to base simulator interface
@@ -601,15 +648,15 @@ class MuJoCo(BaseSimulator):
         self.dof_pos = torch.zeros(self.num_envs, self.num_dof, device=self.sim_device)
         self.dof_vel = torch.zeros(self.num_envs, self.num_dof, device=self.sim_device)
 
-        # Initialize contact forces tensor with correct shape [num_envs, num_bodies, 3]
-        # This matches the interface expected by holosoma (IsaacGym/IsaacSim pattern)
-        self.contact_forces = torch.zeros(self.num_envs, self.num_bodies, 3, device=self.sim_device)
+        # Initialize contact wrench tensor with shape [num_envs, num_bodies, 6]:
+        # [fx, fy, fz, tx, ty, tz]
+        self.contact_forces = torch.zeros(self.num_envs, self.num_bodies, 6, device=self.sim_device)
 
-        # Initialize contact forces history tensor to match IsaacGym/IsaacSim pattern
-        # Shape: [num_envs, history_length, num_bodies, 3]
+        # Initialize contact wrench history tensor.
+        # Shape: [num_envs, history_length, num_bodies, 6]
         history_length = self.simulator_config.contact_sensor_history_length
         self.contact_forces_history = torch.zeros(
-            self.num_envs, history_length, self.num_bodies, 3, device=self.sim_device
+            self.num_envs, history_length, self.num_bodies, 6, device=self.sim_device
         )
 
         # Initialize command system (Phase 1)
@@ -883,10 +930,14 @@ class MuJoCo(BaseSimulator):
                 continue
 
             foot_body_idx = self._foot_body_indices[side]
+            mujoco_foot_body_id = self.holosoma_to_mujoco_body_map.get(foot_body_idx)
+            if mujoco_foot_body_id is None:
+                logger.warning(f"Missing MuJoCo body id for holosoma foot body idx {foot_body_idx} ({side})")
+                continue
             points_w = torch.stack(world_points, dim=0)
-            foot_quat_w = self._rigid_body_rot[0, foot_body_idx]
+            foot_quat_w = self._rigid_body_rot[0, mujoco_foot_body_id]
             foot_quat_inv = quat_inverse(foot_quat_w, w_last=True).unsqueeze(0).repeat(points_w.shape[0], 1)
-            foot_pos_w = self._rigid_body_pos[0, foot_body_idx]
+            foot_pos_w = self._rigid_body_pos[0, mujoco_foot_body_id]
             local_contact_points = quat_apply(
                 foot_quat_inv,
                 points_w - foot_pos_w.unsqueeze(0),
@@ -1484,6 +1535,31 @@ class MuJoCo(BaseSimulator):
         assert self.root_data is not None
         return torch.from_numpy(self.root_data.actuator_force[: self.num_dof]).float().to(self.sim_device)
 
+    def get_foot_force_sensor_wrench(self, side: str, env_id: int = 0) -> torch.Tensor:
+        """Return foot force-torque sensor data expressed in the world frame."""
+        if env_id != 0:
+            raise RuntimeError(f"MuJoCo classic currently only supports single environment (env_id=0), got {env_id}")
+
+        if self.simulator_config.mujoco_backend != MujocoBackend.CLASSIC:
+            raise RuntimeError("World-frame foot force sensor wrench is currently implemented for MuJoCo ClassicBackend.")
+
+        assert self.root_data is not None
+
+        metadata = self._get_foot_force_sensor_metadata(side)
+        force_adr = metadata["force_adr"]
+        torque_adr = metadata["torque_adr"]
+        site_id = metadata["site_id"]
+
+        force_site = self.root_data.sensordata[force_adr : force_adr + 3]
+        torque_site = self.root_data.sensordata[torque_adr : torque_adr + 3]
+
+        site_xmat = self.root_data.site_xmat[site_id].reshape(3, 3)
+        force_world = site_xmat @ force_site
+        torque_world = site_xmat @ torque_site
+
+        wrench_world = np.concatenate([force_world, torque_world], axis=0)
+        return torch.from_numpy(wrench_world).to(device=self.sim_device, dtype=torch.float32)
+
     def _update_text_overlay(self) -> None:
         """Update text overlay based on current state (event-driven).
 
@@ -1622,9 +1698,8 @@ class MuJoCo(BaseSimulator):
         - Multiple geoms can belong to the same body (e.g., robot foot with multiple collision shapes)
         - holosoma expects forces per body, so we need to aggregate geom-level forces to body-level
         - mj_contactForce() returns the 6D force/torque that geom1 exerts on geom2
-        - We only use the first 3 components (forces), ignoring torques for now
 
-        Shape: self.contact_forces = [num_envs, num_bodies, 3] = [1, num_bodies, 3]
+        Shape: self.contact_forces = [num_envs, num_bodies, 6] = [1, num_bodies, 6]
         """
         assert self.root_model
         assert self.root_data
@@ -1649,8 +1724,7 @@ class MuJoCo(BaseSimulator):
             # This gives us the force that geom1 exerts on geom2 at the contact point
             mujoco.mj_contactForce(self.root_model, self.root_data, contact_idx, forcetorque)
 
-            # Extract only the force components (first 3 elements), ignoring torques
-            contact_force = forcetorque[:3]  # [force_x, force_y, force_z]
+            contact_wrench = torch.from_numpy(forcetorque).to(device=self.sim_device, dtype=torch.float32)
 
             # Map geoms to their parent bodies using MuJoCo's geom_bodyid mapping
             # This is necessary because contacts are geom-level but holosoma expects body-level forces
@@ -1665,16 +1739,13 @@ class MuJoCo(BaseSimulator):
 
             # Contact logging is now handled centrally in legged_robot_base._log_contact_forces()
 
-            # Apply Newton's 3rd law: mj_contactForce() result is geom1 exerts on geom2, so geom2's
-            # body gets +force, geom1's body gets -force. Note: skips bodies not in our map
+            # Apply Newton's 3rd law to the full contact wrench.
+            # mj_contactForce() returns the wrench that geom1 exerts on geom2, so geom2's
+            # body gets +wrench and geom1's body gets -wrench. Note: skips bodies not in our map.
             if holosoma_body1_idx is not None:
-                self.contact_forces[0, holosoma_body1_idx] -= (
-                    torch.from_numpy(contact_force).float().to(self.sim_device)
-                )
+                self.contact_forces[0, holosoma_body1_idx] -= contact_wrench
             if holosoma_body2_idx is not None:
-                self.contact_forces[0, holosoma_body2_idx] += (
-                    torch.from_numpy(contact_force).float().to(self.sim_device)
-                )
+                self.contact_forces[0, holosoma_body2_idx] += contact_wrench
 
     def print_mujoco_model_tree(self) -> None:
         """Print comprehensive MuJoCo model structure for debugging."""

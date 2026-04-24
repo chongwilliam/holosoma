@@ -64,10 +64,15 @@ class ClassicBackend(IMujocoBackend):
                 f"Use WarpBackend (use_warp=True) for multi-environment simulation."
             )
 
-        # Pre-allocate contact force tensor
-        self._force_tensor = torch.zeros(1, model.nbody, 3, device=device)
+        # Pre-allocate contact wrench tensor [fx, fy, fz, tx, ty, tz]
+        self._force_tensor = torch.zeros(1, model.nbody, 6, device=device)
+        self._mujoco_to_holosoma_body_map: dict[int, int] = {}
 
         logger.info(f"ClassicBackend initialized: {model.nbody} bodies, device={device}")
+
+    def set_contact_body_index_map(self, mujoco_to_holosoma_body_map: dict[int, int]) -> None:
+        """Store MuJoCo-to-holosoma body index mapping for contact remapping."""
+        self._mujoco_to_holosoma_body_map = dict(mujoco_to_holosoma_body_map)
 
     def step(self) -> None:
         """Advance simulation by one timestep using mj_step."""
@@ -107,7 +112,7 @@ class ClassicBackend(IMujocoBackend):
         Parameters
         ----------
         contact_history_tensor : torch.Tensor
-            Contact force history buffer [num_envs, history_len, num_bodies, 3]
+            Contact wrench history buffer [num_envs, history_len, num_bodies, 6]
         """
         # Reset force accumulator
         self._force_tensor.fill_(0.0)
@@ -115,25 +120,25 @@ class ClassicBackend(IMujocoBackend):
         # Pre-allocate force/torque buffer for mj_contactForce
         forcetorque = np.zeros(6, dtype=np.float64)
 
-        # Extract and accumulate contact forces
+        # Extract and accumulate contact wrenches
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
 
             # Get 6D force/torque vector
             mujoco.mj_contactForce(self.model, self.data, i, forcetorque)
 
-            # Convert to torch tensor (forces only, ignore torques)
-            force = torch.from_numpy(forcetorque[:3]).float().to(self.device)
+            # Convert full wrench to torch tensor
+            wrench = torch.from_numpy(forcetorque).to(device=self.device, dtype=torch.float32)
 
-            # Map geoms to bodies
-            b1 = self.model.geom_bodyid[contact.geom1]
-            b2 = self.model.geom_bodyid[contact.geom2]
+            # Map geoms to bodies, then remap to holosoma/body_names indices.
+            b1 = self._mujoco_to_holosoma_body_map.get(self.model.geom_bodyid[contact.geom1])
+            b2 = self._mujoco_to_holosoma_body_map.get(self.model.geom_bodyid[contact.geom2])
 
-            # Apply Newton's 3rd law: body1 gets -force, body2 gets +force
-            if b1 < self.model.nbody:
-                self._force_tensor[0, b1] -= force
-            if b2 < self.model.nbody:
-                self._force_tensor[0, b2] += force
+            # Apply Newton's 3rd law: body1 gets -wrench, body2 gets +wrench
+            if b1 is not None:
+                self._force_tensor[0, b1] -= wrench
+            if b2 is not None:
+                self._force_tensor[0, b2] += wrench
 
         # Update history: shift old values right, add current at position 0
         contact_history_tensor[:] = torch.cat(
@@ -234,7 +239,7 @@ class ClassicBackend(IMujocoBackend):
         Returns
         -------
         torch.Tensor
-            Contact force tensor [1, num_bodies, 3]
+            Contact wrench tensor [1, num_bodies, 6]
         """
         return self._force_tensor
 

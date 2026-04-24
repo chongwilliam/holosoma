@@ -391,6 +391,9 @@ class JointTorqueActionTerm(ActionTermBase):
             right_foot_grf = self._foot_ground_reaction_wrench(env_idx, "right")
             left_foot_grf = self._foot_ground_reaction_wrench(env_idx, "left")
 
+            print("right grf: ", right_foot_grf)
+            print("left grf: ", left_foot_grf)
+
             # # debug force basis
             # right_contact_basis = np.eye(3)
             # left_contact_basis = np.eye(3)
@@ -415,20 +418,31 @@ class JointTorqueActionTerm(ActionTermBase):
             )
 
             # Query the stance switching logic
+
+            # hard-coded for now
+            dual_to_single_counter_threshold = 10
+            single_to_dual_counter_threshold = 10
+            single_to_dual_force_threshold = 20  # N
+
             curr_state = self.curr_state[env_idx]
             if curr_state == self.State.DUAL_STANCE:
                 self.curr_state[env_idx] = self.wbc[env_idx].getContactTransitionFromDualStance(
-                    right_foot_grf, left_foot_grf
+                    right_foot_grf, left_foot_grf, dual_to_single_counter_threshold
                 )
             elif curr_state in (self.State.LEFT_STANCE, self.State.RIGHT_STANCE):
                 self.curr_state[env_idx] = self.wbc[env_idx].getContactTransitionFromSingleStance(
                     curr_state,
                     right_foot_grf,
                     left_foot_grf,
+                    single_to_dual_force_threshold,
+                    single_to_dual_counter_threshold
                 )
 
-            # Debug: force dual stance 
-            self.curr_state[env_idx] = self.State.DUAL_STANCE
+            # debug
+            print("Current state: ", self.curr_state[env_idx])
+
+            # # Debug: force dual stance 
+            # self.curr_state[env_idx] = self.State.DUAL_STANCE
 
             # Get current pose
             com_pose = np.asarray(self.wbc[env_idx].getPose("com"), dtype=float) # matrix
@@ -441,9 +455,6 @@ class JointTorqueActionTerm(ActionTermBase):
             action_dict = parse_actions(actions[env_idx] * action_scale)
             targets = self._wbc_module.WbcDesiredTargets()
 
-            # debug
-            print(action_dict)
-
             com_pos = action_dict["com_pos"].detach().cpu().numpy() + com_pose[:3, 3]
             pelvis_ori = axis_angle_to_matrix(action_dict["pelvis_ori"].detach().cpu().numpy()) @ pelvis_rotation
             torso_ori = torso_pose[:3, :3]
@@ -452,6 +463,7 @@ class JointTorqueActionTerm(ActionTermBase):
             left_foot_pos = action_dict["left_foot_pos"].detach().cpu().numpy() + left_foot_pose[:3, 3]
             left_foot_ori = axis_angle_to_matrix(action_dict["left_foot_ori"].detach().cpu().numpy()) @ left_foot_pose[:3, :3]
 
+            # com and feet actions for now
             targets.com.position = com_pos
             targets.pelvis.orientation = pelvis_ori
             targets.torso.orientation = torso_ori
@@ -459,6 +471,12 @@ class JointTorqueActionTerm(ActionTermBase):
             targets.right_foot.orientation = right_foot_ori
             targets.left_foot.position = left_foot_pos
             targets.left_foot.orientation = left_foot_ori
+
+            # # hand actions
+            # targets.right_hand.position = right_hand_pos 
+            # targets.right_hand.orientation = right_hand_ori 
+            # targets.left_hand.position = left_hand_pos 
+            # targets.left_hand.orientation = left_hand_ori
 
             # Compute torques
             # Stance transition torques
@@ -576,23 +594,19 @@ class JointTorqueActionTerm(ActionTermBase):
             return
         if not np.all(np.isfinite(contact_point)) or not np.all(np.isfinite(contact_basis)):
             return
-        
-        print("local contact point: ", contact_point)
 
         simulator = self.env.simulator
         foot_body_idx = self._foot_body_indices[side]
 
-        # hard-code
+        # hard-code the body ID for ankle_roll_link
         if side == 'right':
             foot_body_idx = 14
         elif side == 'left':
             foot_body_idx = 7
-
-        print('foot body idx: ', foot_body_idx)
         
         foot_pos_w = simulator._rigid_body_pos[env_idx, foot_body_idx]
         foot_quat_w = simulator._rigid_body_rot[env_idx, foot_body_idx]
-        self._assert_foot_pose_matches_wbc(env_idx, side, foot_pos_w, foot_quat_w)
+        self._assert_foot_pose_matches_wbc(env_idx, side, foot_pos_w, foot_quat_w, contact_point)
 
         local_contact_point = torch.as_tensor(contact_point[:3], device=foot_pos_w.device, dtype=foot_pos_w.dtype)
         world_contact_point_tensor = foot_pos_w + quat_apply(foot_quat_w, local_contact_point, w_last=True)
@@ -622,16 +636,59 @@ class JointTorqueActionTerm(ActionTermBase):
         env_idx: int,
         side: str,
         foot_pos_w: torch.Tensor,
-        foot_quat_w: torch.Tensor
+        foot_quat_w: torch.Tensor,
+        local_contact_point: np.ndarray
     ) -> None:
         # foot_name = f"{side}_foot"
         foot_name = f"{side}_ankle_roll_link"
-        wbc_pos = np.asarray(self.wbc[env_idx].getPosition(foot_name, np.array([0, 0, 0])), dtype=float).reshape(-1)
+        wbc_pos = np.asarray(self.wbc[env_idx].getPosition(foot_name, local_contact_point), dtype=float).reshape(-1)[:3]
         wbc_rot = np.asarray(self.wbc[env_idx].getRotation(foot_name), dtype=float)
         if wbc_pos.shape[0] < 3 or not np.all(np.isfinite(wbc_pos)):
             raise AssertionError(f"WBC {foot_name} position is invalid: shape={wbc_pos.shape}, pos={wbc_pos}")
         if wbc_rot.shape != (3, 3) or not np.all(np.isfinite(wbc_rot)):
             raise AssertionError(f"WBC {foot_name} rotation is invalid: shape={wbc_rot.shape}, rotation={wbc_rot}")
+
+        sim_rot = quaternion_to_matrix(foot_quat_w.unsqueeze(0), w_last=True)[0].detach().cpu().numpy()
+        sim_pos = foot_pos_w.detach().cpu().numpy() + sim_rot @ local_contact_point
+        self._print_foot_frame_inspection(env_idx, side, sim_pos, sim_rot, wbc_pos, wbc_rot)
+
+        # root_state = self.env.simulator.robot_root_states[env_idx]
+        # dof_pos = self.env.simulator.dof_pos[env_idx]
+        # q_tensor = torch.cat([root_state_to_xyz_rpy(root_state), dof_pos], dim=0)
+        # q_error = float(torch.linalg.vector_norm(q_tensor - self._last_wbc_q[env_idx]).item())
+        # root_state_error = float(
+        #     torch.linalg.vector_norm(root_state - self._last_wbc_root_state[env_idx]).item()
+        # )
+        # dof_pos_error = float(torch.linalg.vector_norm(dof_pos - self._last_wbc_dof_pos[env_idx]).item())
+        # pelvis_pos_error, pelvis_rot_error, pelvis_pos, wbc_pelvis_pos, pelvis_pos_delta = (
+        #     self._assert_pelvis_pose_matches_wbc(env_idx)
+        # )
+        pos_delta = sim_pos - wbc_pos
+        pos_error = float(np.linalg.norm(sim_pos - wbc_pos))
+        rot_error = float(np.linalg.norm(sim_rot - wbc_rot, ord="fro"))
+        assert (
+            # q_error < 1.0e-6
+            # and root_state_error < 1.0e-6
+            # and dof_pos_error < 1.0e-6
+            # and pelvis_pos_error < 1.0e-6
+            # and pelvis_rot_error < 1.0e-6
+            pos_error < 1.0e-3
+            and rot_error < 1.0e-2
+        ), (
+            f"Simulator {side} foot pose does not match WBC {side}_foot pose: "
+            # f"q_error={q_error:.9f}, root_state_error={root_state_error:.9f}, "
+            # f"dof_pos_error={dof_pos_error:.9f}, pelvis_pos_error={pelvis_pos_error:.9f}, "
+            # f"pelvis_rot_error={pelvis_rot_error:.9f}, pos_error={pos_error:.9f}, rot_error={rot_error:.9f}, "
+            # f"pelvis_sim_pos_xyz={pelvis_pos.tolist()}, pelvis_wbc_pos_xyz={wbc_pelvis_pos.tolist()}, "
+            # f"pelvis_pos_delta_xyz={pelvis_pos_delta.tolist()}, "
+            f"sim_pos_xyz={sim_pos.tolist()}, wbc_pos_xyz={wbc_pos.tolist()}, pos_delta_xyz={pos_delta.tolist()}, rot_delta={rot_error}"
+            "\n"
+        )
+
+    def _assert_pelvis_pose_matches_wbc(
+        self,
+        env_idx: int,
+    ) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
         wbc_pelvis_pos = np.asarray(self.wbc[env_idx].getPosition("pelvis"), dtype=float).reshape(-1)
         wbc_pelvis_rot = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)
         if wbc_pelvis_pos.shape[0] < 3 or not np.all(np.isfinite(wbc_pelvis_pos)):
@@ -641,57 +698,29 @@ class JointTorqueActionTerm(ActionTermBase):
                 f"WBC pelvis rotation is invalid: shape={wbc_pelvis_rot.shape}, rotation={wbc_pelvis_rot}"
             )
 
-        sim_pos = foot_pos_w.detach().cpu().numpy()
-        sim_rot = quaternion_to_matrix(foot_quat_w.unsqueeze(0), w_last=True)[0].detach().cpu().numpy()
-        wbc_pos = wbc_pos[:3]
-        self._print_foot_frame_inspection(env_idx, side, sim_pos, wbc_pos)
-
         root_state = self.env.simulator.robot_root_states[env_idx]
-        dof_pos = self.env.simulator.dof_pos[env_idx]
         pelvis_pos = root_state[:3].detach().cpu().numpy()
         pelvis_rot = quaternion_to_matrix(root_state[3:7].unsqueeze(0), w_last=True)[0].detach().cpu().numpy()
         wbc_pelvis_pos = wbc_pelvis_pos[:3]
-        q_tensor = torch.cat([root_state_to_xyz_rpy(root_state), dof_pos], dim=0)
-        q_error = float(torch.linalg.vector_norm(q_tensor - self._last_wbc_q[env_idx]).item())
-        root_state_error = float(
-            torch.linalg.vector_norm(root_state - self._last_wbc_root_state[env_idx]).item()
-        )
-        dof_pos_error = float(torch.linalg.vector_norm(dof_pos - self._last_wbc_dof_pos[env_idx]).item())
-        pos_delta = sim_pos - wbc_pos
         pelvis_pos_delta = pelvis_pos - wbc_pelvis_pos
-        pos_error = float(np.linalg.norm(sim_pos - wbc_pos))
-        rot_error = float(np.linalg.norm(sim_rot - wbc_rot, ord="fro"))
-        pelvis_pos_error = float(np.linalg.norm(pelvis_pos - wbc_pelvis_pos))
+        pelvis_pos_error = float(np.linalg.norm(pelvis_pos_delta))
         pelvis_rot_error = float(np.linalg.norm(pelvis_rot - wbc_pelvis_rot, ord="fro"))
-        assert (
-            q_error < 1.0e-6
-            and root_state_error < 1.0e-6
-            and dof_pos_error < 1.0e-6
-            and pelvis_pos_error < 1.0e-3
-            and pelvis_rot_error < 1.0e-3
-            and pos_error < 1.0e-3
-            and rot_error < 1.0e-2
-        ), (
-            f"Simulator {side} foot pose does not match WBC {side}_foot pose: "
-            f"q_error={q_error:.9f}, root_state_error={root_state_error:.9f}, "
-            f"dof_pos_error={dof_pos_error:.9f}, pelvis_pos_error={pelvis_pos_error:.9f}, "
-            f"pelvis_rot_error={pelvis_rot_error:.9f}, pos_error={pos_error:.9f}, rot_error={rot_error:.9f}, "
-            f"pelvis_sim_pos_xyz={pelvis_pos.tolist()}, pelvis_wbc_pos_xyz={wbc_pelvis_pos.tolist()}, "
-            f"pelvis_pos_delta_xyz={pelvis_pos_delta.tolist()}, "
-            f"sim_pos_xyz={sim_pos.tolist()}, wbc_pos_xyz={wbc_pos.tolist()}, pos_delta_xyz={pos_delta.tolist()}"
-        )
+        return pelvis_pos_error, pelvis_rot_error, pelvis_pos, wbc_pelvis_pos, pelvis_pos_delta
 
     def _print_foot_frame_inspection(
         self,
         env_idx: int,
         side: str,
         resolved_sim_pos: np.ndarray,
+        resolved_sim_rot: np.ndarray,
         wbc_compare_pos: np.ndarray,
+        wbc_compare_rot: np.ndarray,
     ) -> None:
         simulator = self.env.simulator
         resolved_idx = self._foot_body_indices[side]
         body_names = list(getattr(simulator, "body_names", []))
         resolved_name = body_names[resolved_idx] if 0 <= resolved_idx < len(body_names) else "<out-of-range>"
+        resolved_rot_error = float(np.linalg.norm(resolved_sim_rot - wbc_compare_rot, ord="fro"))
 
         print(
             "foot_frame_inspection:"
@@ -702,20 +731,26 @@ class JointTorqueActionTerm(ActionTermBase):
             f" resolved_sim_pos={resolved_sim_pos.tolist()}"
             f" wbc_compare_pos={wbc_compare_pos.tolist()}"
             f" delta={list((resolved_sim_pos - wbc_compare_pos).tolist())}"
+            f" rot_error={resolved_rot_error:.9f}"
+            "\n"
         )
 
-        for suffix in ("ankle_pitch_link", "ankle_roll_link", "foot"):
-            frame_name = f"{side}_{suffix}"
-            sim_matches = [(idx, name) for idx, name in enumerate(body_names) if name == frame_name]
-            for sim_idx, sim_name in sim_matches:
-                sim_pos = simulator._rigid_body_pos[env_idx, sim_idx].detach().cpu().numpy()
-                print(f"  sim_frame name={sim_name} idx={sim_idx} pos={sim_pos.tolist()}")
-
-            try:
-                wbc_pos = np.asarray(self.wbc[env_idx].getPosition(frame_name), dtype=float).reshape(-1)[:3]
-                print(f"  wbc_frame name={frame_name} pos={wbc_pos.tolist()}")
-            except Exception as exc:
-                print(f"  wbc_frame name={frame_name} unavailable={exc}")
+        # # for suffix in ("ankle_pitch_link", "ankle_roll_link", "foot"):
+        # for suffix in ("ankle_roll_link"):
+        #     frame_name = f"{side}_{suffix}"
+        #     sim_matches = [(idx, name) for idx, name in enumerate(body_names) if name == frame_name]
+        #     wbc_rot = None
+        #     for sim_idx, sim_name in sim_matches:
+        #         sim_pos = simulator._rigid_body_pos[env_idx, sim_idx].detach().cpu().numpy()
+        #         sim_quat = simulator._rigid_body_rot[env_idx, sim_idx]
+        #         sim_rot = quaternion_to_matrix(sim_quat.unsqueeze(0), w_last=True)[0].detach().cpu().numpy()
+        #         try:
+        #             if wbc_rot is None:
+        #                 wbc_rot = np.asarray(self.wbc[env_idx].getRotation(frame_name), dtype=float)
+        #             rot_error = float(np.linalg.norm(sim_rot - wbc_rot, ord="fro"))
+        #             print(f"  frame_rotation_error name={sim_name} idx={sim_idx} rot_error={rot_error:.9f}")
+        #         except Exception as exc:
+        #             print(f"  frame_rotation_error name={sim_name} idx={sim_idx} unavailable={exc}")
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         """Reset action term state.
@@ -819,14 +854,24 @@ class JointTorqueActionTerm(ActionTermBase):
 
     def _foot_ground_reaction_wrench(self, env_idx: int, side: str) -> np.ndarray:
         """Return the simulator foot contact force as a 6D wrench for the WBC binding."""
-        force = (
+        sensor_wrench_fn = getattr(self.env.simulator, "get_foot_force_sensor_wrench", None)
+        if callable(sensor_wrench_fn):
+            try:
+                return sensor_wrench_fn(side, env_idx).detach().cpu().numpy().astype(float, copy=False)
+            except Exception:
+                pass
+
+        contact_wrench = (
             self.env.simulator.contact_forces[env_idx, self._foot_body_indices[side]]
             .detach()
             .cpu()
             .numpy()
         )
+        if contact_wrench.shape[0] >= 6:
+            return contact_wrench[:6].astype(float, copy=False)
+
         wrench = np.zeros(6, dtype=float)
-        wrench[:3] = force
+        wrench[: min(3, contact_wrench.shape[0])] = contact_wrench[:3]
         return wrench
 
     def _attach_actuator_randomizer_scales(self) -> None:

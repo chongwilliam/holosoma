@@ -25,7 +25,7 @@ def contact_forces_exceeded(
     termination config instead of using a flag.
     """
     indices = getattr(env, contact_indices_attr)
-    contact_forces = env.simulator.contact_forces[:, indices, :]
+    contact_forces = env.simulator.contact_forces[:, indices, :3]
     return torch.any(torch.norm(contact_forces, dim=-1) > force_threshold, dim=1)
 
 

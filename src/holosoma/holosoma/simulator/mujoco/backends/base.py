@@ -64,8 +64,13 @@ class IMujocoBackend(abc.ABC):
         Parameters
         ----------
         contact_history_tensor : torch.Tensor
-            Contact force history buffer to update [num_envs, history_len, num_bodies, 3]
+            Contact wrench history buffer to update [num_envs, history_len, num_bodies, 6]
         """
+        ...
+
+    @abc.abstractmethod
+    def set_contact_body_index_map(self, mujoco_to_holosoma_body_map: dict[int, int]) -> None:
+        """Configure contact tensor remapping from MuJoCo body ids to holosoma body indices."""
         ...
 
     @abc.abstractmethod
@@ -192,7 +197,7 @@ class IMujocoBackend(abc.ABC):
 
     @abc.abstractmethod
     def create_force_view(self, num_bodies: int) -> torch.Tensor:
-        """Create tensor for contact forces [num_envs, num_bodies, 3].
+        """Create tensor for contact wrenches [num_envs, num_bodies, 6].
 
         Parameters
         ----------
@@ -202,7 +207,7 @@ class IMujocoBackend(abc.ABC):
         Returns
         -------
         torch.Tensor
-            Contact force tensor
+            Contact wrench tensor [fx, fy, fz, tx, ty, tz]
         """
         ...
 

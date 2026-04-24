@@ -182,6 +182,7 @@ Changed group of some visual geoms to support ray-tracing that passes through ro
                                 <geom class="visual" mesh="left_ankle_pitch_link"/>
                                 <body name="left_ankle_roll_link" pos="0 0 -0.017558">
                                     <site name="left_foot" rgba="1 0 0 1"/>
+                                    <site name="left_ankle_roll_force_site" pos="0 0 0" size="0.005"/>
                                     <inertial pos="0.026505 0 -0.016425" quat="-0.000481092 0.728482 -0.000618967 0.685065" mass="0.608"
                                             diaginertia="0.00167218 0.0016161 0.000217621"/>
                                     <joint name="left_ankle_roll_joint" class="ankle_roll"/>
@@ -233,6 +234,7 @@ Changed group of some visual geoms to support ray-tracing that passes through ro
                                 <geom class="visual" mesh="right_ankle_pitch_link"/>
                                 <body name="right_ankle_roll_link" pos="0 0 -0.017558">
                                     <site name="right_foot" pos="0 0 0"/>
+                                    <site name="right_ankle_roll_force_site" pos="0 0 0" size="0.005"/>
                                     <inertial pos="0.026505 0 -0.016425" quat="0.000481092 0.728482 0.000618967 0.685065" mass="0.608"
                                             diaginertia="0.00167218 0.0016161 0.000217621"/>
                                     <joint name="right_ankle_roll_joint" class="ankle_roll"/>
@@ -482,5 +484,9 @@ Changed group of some visual geoms to support ray-tracing that passes through ro
 
         <framequat name="mid360_quat" objtype="site" objname="mid360"/>
         <framepos name="mid360_pos" objtype="site" objname="mid360"/>
+        <force name="left_ankle_roll_force" site="right_foot"/>
+        <torque name="left_ankle_roll_torque" site="right_foot"/>
+        <force name="right_ankle_roll_force" site="left_foot"/>
+        <torque name="right_ankle_roll_torque" site="left_foot"/>
     </sensor>
 </mujoco>
