@@ -13,4 +13,15 @@ g1_29dof_joint_pos = ActionManagerCfg(
     }
 )
 
-__all__ = ["g1_29dof_joint_pos"]
+g1_29dof_torque = ActionManagerCfg(
+    terms={
+        "torque_control": ActionTermCfg(
+            func="holosoma.managers.action.terms.torque_control:JointTorqueActionTerm",
+            params={},
+            scale=1.0,
+            clip=None,
+        ),
+    }
+)
+
+__all__ = ["g1_29dof_joint_pos", "g1_29dof_torque"]

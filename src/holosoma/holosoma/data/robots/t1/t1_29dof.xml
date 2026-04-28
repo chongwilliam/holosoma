@@ -1,6 +1,6 @@
 <mujoco model="T1">
     <compiler angle="radian" meshdir="meshes/" />
-    <size njmax="500" nconmax="100" />
+    <size njmax="10000" nconmax="100" />
 
     <default>
         <joint limited="true" damping="0.01" armature="0.01" frictionloss="0.0" />

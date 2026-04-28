@@ -291,7 +291,46 @@ class SymmetryUtils:
             Joint mappings are applied and signs are flipped as appropriate.
             Returns [a_mapped0 * sign0, a_mapped1 * sign1, ..., a_mappedN * signN] (mirrored and sign-flipped).
         """
+        if action.shape[-1] == 21:
+            return self._mirror_wbc_task_space_action(action)
+
+        if action.shape[-1] != self.joint_index_map.shape[0]:
+            raise ValueError(
+                f"Unsupported action dimension for symmetry augmentation: got {action.shape[-1]}, "
+                f"expected 21 for WBC task-space actions or {self.joint_index_map.shape[0]} for joint-space actions."
+            )
+
         return action[..., self.joint_index_map] * self.sign_flip_mask
+
+    def _mirror_wbc_task_space_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Mirror the 21-D WBC task-space action layout used by JointTorqueActionTerm.
+
+        Layout:
+        [com_pos(3), pelvis_axis_angle(3), torso_axis_angle(3),
+         right_foot_pos(3), right_foot_axis_angle(3),
+         left_foot_pos(3), left_foot_axis_angle(3)]
+        """
+        mirrored = action.clone()
+
+        def mirror_position(vec: torch.Tensor) -> torch.Tensor:
+            out = vec.clone()
+            out[..., 1] = -out[..., 1]
+            return out
+
+        def mirror_axis_angle(vec: torch.Tensor) -> torch.Tensor:
+            out = vec.clone()
+            out[..., 0] = -out[..., 0]
+            out[..., 2] = -out[..., 2]
+            return out
+
+        mirrored[..., 0:3] = mirror_position(action[..., 0:3])
+        mirrored[..., 3:6] = mirror_axis_angle(action[..., 3:6])
+        mirrored[..., 6:9] = mirror_axis_angle(action[..., 6:9])
+        mirrored[..., 9:12] = mirror_position(action[..., 15:18])
+        mirrored[..., 12:15] = mirror_axis_angle(action[..., 18:21])
+        mirrored[..., 15:18] = mirror_position(action[..., 9:12])
+        mirrored[..., 18:21] = mirror_axis_angle(action[..., 12:15])
+        return mirrored
 
     def mirror_obs_base_lin_vel(self, base_lin_vel: torch.Tensor) -> torch.Tensor:
         """Mirrors the base linear velocity in robot's base frame.
@@ -522,6 +561,15 @@ class SymmetryUtils:
             Mirrored actions with same transformation as joint positions.
             Outputs: [a_mapped0 * sign0, a_mapped1 * sign1, ..., a_mappedN * signN] (mirrored and sign-flipped).
         """
+        if actions.shape[-1] == 21:
+            return self._mirror_wbc_task_space_action(actions)
+
+        if actions.shape[-1] != self.joint_index_map.shape[0]:
+            raise ValueError(
+                f"Unsupported action observation dimension for symmetry augmentation: got {actions.shape[-1]}, "
+                f"expected 21 for WBC task-space actions or {self.joint_index_map.shape[0]} for joint-space actions."
+            )
+
         return actions[..., self.joint_index_map] * self.sign_flip_mask
 
     def mirror_obs_ee_apply_force(self, ee_apply_force: torch.Tensor) -> torch.Tensor:

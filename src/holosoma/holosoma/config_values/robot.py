@@ -11,7 +11,8 @@ from holosoma.config_types.robot import (
 g1_29dof = RobotConfig(
     num_bodies=32,
     dof_obs_size=29,
-    actions_dim=29,
+    # actions_dim=29,
+    actions_dim=21,
     policy_obs_dim=-1,
     critic_obs_dim=-1,
     algo_obs_dim_dict={},

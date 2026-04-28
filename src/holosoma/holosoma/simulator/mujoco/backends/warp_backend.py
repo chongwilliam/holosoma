@@ -144,26 +144,33 @@ class WarpBackend(IMujocoBackend):
             self.ctrl_t = wp.to_torch(self.mjw_data.ctrl)  # [num_envs, nu]
             self.cfrc_t = wp.to_torch(self.mjw_data.cfrc_ext)  # [num_envs, nbody, 6]
             self.xfrc_applied_t = wp.to_torch(self.mjw_data.xfrc_applied)  # [num_envs, nbody, 6]
+            self.sensordata_t = wp.to_torch(self.mjw_data.sensordata)  # [num_envs, nsensordata]
 
             # Rigid body state tensors (for zero-copy access during refresh_sim_tensors)
             self.xpos_t = wp.to_torch(self.mjw_data.xpos)  # [num_envs, nbody, 3] - positions
             self.xquat_t = wp.to_torch(self.mjw_data.xquat)  # [num_envs, nbody, 4] - orientations [w,x,y,z]
             self.cvel_t = wp.to_torch(self.mjw_data.cvel)  # [num_envs, nbody, 6] - velocities [ang(3), lin(3)]
+            self.site_xmat_t = wp.to_torch(self.mjw_data.site_xmat)  # [num_envs, nsite, 3, 3] or [..., 9]
 
         # Keep reference to CPU data for rendering (synced on demand)
         self.render_data = data
         self._mujoco_to_holosoma_body_map: dict[int, int] = {}
         self._force_tensor = torch.zeros(self.num_envs, model.nbody, 6, device=device)
 
-        # Capture simulation step as CUDA graph for optimal performance
-        # This eliminates per-kernel launch overhead (~20-30 kernels per step)
-        # and enables GPU pipelining, providing 5-10x speedup
-        logger.info("Capturing CUDA graph for simulation step...")
-        with wp.ScopedDevice(self.mjw_device):
-            with wp.ScopedCapture() as capture:
-                mjw.step(self.mjw_model, self.mjw_data)
-            self.step_graph = capture.graph
-        logger.info("CUDA graph captured successfully")
+        self._use_cuda_graph = bool(getattr(self.mjw_device, "is_cuda", False))
+        self.step_graph = None
+        if self._use_cuda_graph:
+            # Capture simulation step as CUDA graph for optimal performance.
+            # This eliminates per-kernel launch overhead (~20-30 kernels per step)
+            # and enables GPU pipelining, providing 5-10x speedup.
+            logger.info("Capturing CUDA graph for simulation step...")
+            with wp.ScopedDevice(self.mjw_device):
+                with wp.ScopedCapture() as capture:
+                    mjw.step(self.mjw_model, self.mjw_data)
+                self.step_graph = capture.graph
+            logger.info("CUDA graph captured successfully")
+        else:
+            logger.warning("WarpBackend is running on a non-CUDA device; disabling CUDA graph capture.")
 
         logger.info(
             f"WarpBackend initialized: {model.nbody} bodies, {model.nq} qpos, {model.nv} qvel, {model.nu} actuators"
@@ -219,11 +226,15 @@ class WarpBackend(IMujocoBackend):
         GPU work completes asynchronously while CPU prepares next frame.
         Synchronization happens only when needed (e.g., in get_render_data()).
         """
+        import mujoco_warp as mjw
         import warp as wp
 
         with wp.ScopedDevice(self.mjw_device):
-            wp.capture_launch(self.step_graph)
-            # No wp.synchronize() - let GPU work in parallel with CPU
+            if self._use_cuda_graph:
+                wp.capture_launch(self.step_graph)
+                # No wp.synchronize() - let GPU work in parallel with CPU
+            else:
+                mjw.step(self.mjw_model, self.mjw_data)
 
     def get_render_data(self, world_id: int = 0) -> mujoco.MjData:
         """Sync GPU data to CPU for rendering.
@@ -288,7 +299,9 @@ class WarpBackend(IMujocoBackend):
         """
         self._force_tensor.zero_()
         for mujoco_body_id, holosoma_body_idx in self._mujoco_to_holosoma_body_map.items():
-            self._force_tensor[:, holosoma_body_idx] = self.cfrc_t[:, mujoco_body_id]
+            cfrc = self.cfrc_t[:, mujoco_body_id]
+            self._force_tensor[:, holosoma_body_idx, :3] = cfrc[:, 3:6]
+            self._force_tensor[:, holosoma_body_idx, 3:6] = cfrc[:, :3]
 
         # Update history: shift old values right, add current at position 0
         contact_history_tensor[:] = torch.cat([self._force_tensor.unsqueeze(1), contact_history_tensor[:, :-1]], dim=1)
@@ -577,9 +590,10 @@ class WarpBackend(IMujocoBackend):
         env_ids : torch.Tensor
             Environment IDs to update [num_selected_envs]
         dof_states : torch.Tensor
-            DOF states [num_all_envs * num_dofs, 2] in IsaacGym format
+            DOF states in flattened IsaacGym format. Supported shapes:
+            - [num_selected_envs * num_dofs, 2]: pre-sliced for env_ids
+            - [num_all_envs * num_dofs, 2]: full global tensor for all envs
             where [:, 0] = positions, [:, 1] = velocities
-            NOTE: Contains states for ALL environments, we select based on env_ids
         dof_addrs : dict
             Address dictionary with 'dof_qpos_addrs' and 'dof_qvel_addrs' lists
         """
@@ -587,25 +601,31 @@ class WarpBackend(IMujocoBackend):
         qpos_addrs = dof_addrs["dof_qpos_addrs"]
         qvel_addrs = dof_addrs["dof_qvel_addrs"]
         num_dof = len(qpos_addrs)
+        num_selected = len(env_ids)
 
-        # Vectorized selection: extract only rows for specified env_ids
-        # dof_states is [num_all_envs * num_dof, 2], need [len(env_ids) * num_dof, 2]
-        offsets = env_ids.unsqueeze(1) * num_dof  # [len(env_ids), 1]
-        dof_offsets = torch.arange(num_dof, device=env_ids.device).unsqueeze(0)  # [1, num_dof]
-        indices = (offsets + dof_offsets).flatten()  # [len(env_ids) * num_dof]
-
-        selected_dof_states = dof_states[indices]  # [len(env_ids) * num_dof, 2]
+        if dof_states.shape == (num_selected * num_dof, 2):
+            selected_dof_states = dof_states
+        elif dof_states.shape == (self.num_envs * num_dof, 2):
+            offsets = env_ids.unsqueeze(1) * num_dof  # [num_selected, 1]
+            dof_offsets = torch.arange(num_dof, device=env_ids.device).unsqueeze(0)  # [1, num_dof]
+            indices = (offsets + dof_offsets).flatten()  # [num_selected * num_dof]
+            selected_dof_states = dof_states[indices]
+        else:
+            raise ValueError(
+                f"Unsupported dof_states tensor format for WarpBackend: {tuple(dof_states.shape)}. "
+                f"Expected [{num_selected * num_dof}, 2] or [{self.num_envs * num_dof}, 2]"
+            )
 
         # Reshape from flattened IsaacGym format
-        dof_pos = selected_dof_states[:, 0].view(len(env_ids), num_dof)  # [num_selected_envs, num_dof]
-        dof_vel = selected_dof_states[:, 1].view(len(env_ids), num_dof)  # [num_selected_envs, num_dof]
+        dof_pos = selected_dof_states[:, 0].view(num_selected, num_dof)  # [num_selected_envs, num_dof]
+        dof_vel = selected_dof_states[:, 1].view(num_selected, num_dof)  # [num_selected_envs, num_dof]
 
         # Vectorized GPU tensor writes using explicit expand for shape matching
-        N = len(env_ids)
+        N = num_selected
 
         # Convert address lists to tensors
-        qpos_indices = torch.tensor(qpos_addrs, device=env_ids.device)  # [num_dof]
-        qvel_indices = torch.tensor(qvel_addrs, device=env_ids.device)  # [num_dof]
+        qpos_indices = torch.tensor(qpos_addrs, device=env_ids.device, dtype=torch.long)  # [num_dof]
+        qvel_indices = torch.tensor(qvel_addrs, device=env_ids.device, dtype=torch.long)  # [num_dof]
 
         # Explicit expand to [N, num_dof] for both indices
         env_idx = env_ids.unsqueeze(1).expand(N, num_dof)  # [N, num_dof]

@@ -111,6 +111,18 @@ class FastSACEnv:
         the furthest limit from default.
         """
         robot_config = self._env.robot_config
+        num_actions = int(robot_config.actions_dim)
+        num_dof = len(robot_config.dof_names)
+
+        # Task-space controllers (e.g. WBC) may expose a policy action space that does
+        # not correspond 1:1 with actuated joints. In that case we cannot derive per-joint
+        # tanh bounds from joint limits, so use unit scaling in policy action space.
+        if num_actions != num_dof:
+            logger.info(
+                "Using unit action scaling for FastSAC actor because actions_dim "
+                f"({num_actions}) != num_dof ({num_dof})."
+            )
+            return torch.ones(num_actions, device=self._env.device)
 
         # Get joint limits and default positions
         dof_pos_lower_limits = torch.tensor(robot_config.dof_pos_lower_limit_list, device=self._env.device)
@@ -135,7 +147,7 @@ class FastSACEnv:
         # So our scaling factor should be: max_range / action_scale
         action_scaling_factors = max_range / action_scale
 
-        logger.info(f"Computed action scaling factors for {len(robot_config.dof_names)} DOFs")
+        logger.info(f"Computed action scaling factors for {num_dof} DOFs")
         logger.info(f"Action scale: {action_scale}")
         logger.info(f"Scaling: {action_scaling_factors}")
 

@@ -65,6 +65,7 @@ def _build_config(
 ):
     simulator_cfg = {
         "mujoco": simulator_defaults.mujoco,
+        "mjwarp": simulator_defaults.mjwarp,
         "isaacsim": simulator_defaults.isaacsim,
     }[simulator_name]
 
@@ -169,6 +170,38 @@ def _both_feet_in_contact(simulator) -> bool:
     return _contact_count(simulator, "right") > 0 and _contact_count(simulator, "left") > 0
 
 
+def _foot_grf(env, term, side: str) -> torch.Tensor:
+    grf_fn = getattr(term, "_foot_ground_reaction_wrench", None)
+    if callable(grf_fn):
+        try:
+            return torch.as_tensor(grf_fn(0, side), device=env.device, dtype=torch.float32)
+        except RuntimeError:
+            exit(0)
+            pass
+
+    foot_indices = getattr(term, "_foot_body_indices", {})
+    body_idx = foot_indices.get(side) if isinstance(foot_indices, dict) else None
+    if body_idx is None:
+        body_names = list(getattr(env.simulator, "body_names", []))
+        foot_body_name = getattr(env.robot_config, "foot_body_name", "foot")
+        exact_name = f"{side}_{foot_body_name}"
+        body_idx = next((idx for idx, name in enumerate(body_names) if name == exact_name), None)
+        if body_idx is None:
+            body_idx = next(
+                (idx for idx, name in enumerate(body_names) if side in name.lower() and foot_body_name in name),
+                None,
+            )
+
+    contact_forces = getattr(env.simulator, "contact_forces", None)
+    if body_idx is None or contact_forces is None or contact_forces.numel() == 0:
+        return torch.full((6,), float("nan"), device=env.device, dtype=torch.float32)
+
+    wrench = contact_forces[0, body_idx]
+    if wrench.shape[-1] == 3:
+        wrench = torch.cat([wrench, torch.zeros(3, device=wrench.device, dtype=wrench.dtype)], dim=0)
+    return wrench[:6].to(device=env.device, dtype=torch.float32)
+
+
 def _state_tensor(value) -> torch.Tensor:
     tensor = value.clone() if hasattr(value, "clone") else torch.as_tensor(value)
     return tensor.detach() if hasattr(tensor, "detach") else tensor
@@ -235,13 +268,15 @@ def _apply_hold_torques(
     simulator.apply_torques_at_dof(torques)
 
 
-def _print_hold_summary(hold_step_idx: int, env) -> None:
+def _print_hold_summary(hold_step_idx: int, env, term) -> None:
     print(
         f"hold_step={hold_step_idx}"
         f" sim_time={float(env.simulator.time()):.6f}"
         f" root_pos={_format_tensor_row(_root_pos(env))}"
         f" right_count={_contact_count(env.simulator, 'right')}"
+        f" right_grf={_format_tensor_row(_foot_grf(env, term, 'right'))}"
         f" left_count={_contact_count(env.simulator, 'left')}"
+        f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
     )
 
 
@@ -257,7 +292,9 @@ def _print_step_summary(control_step_idx: int, sim_step_idx: int, env, term) -> 
         f" torque_norm={float(torch.linalg.vector_norm(torques).item()):.6f}"
         f" torque_max={float(torch.max(torch.abs(torques)).item()):.6f}"
         f" right_count={_contact_count(env.simulator, 'right')}"
+        f" right_grf={_format_tensor_row(_foot_grf(env, term, 'right'))}"
         f" left_count={_contact_count(env.simulator, 'left')}"
+        f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
     )
 
 
@@ -291,7 +328,7 @@ def main() -> int:
     )
     parser.add_argument("--print-every", type=int, default=1, help="Print summary every N control steps.")
     parser.add_argument("--device", default=None, help="Override simulation device.")
-    parser.add_argument("--simulator", choices=("mujoco", "isaacsim"), default="isaacsim")
+    parser.add_argument("--simulator", choices=("mujoco", "mjwarp", "isaacsim"), default="isaacsim")
     parser.add_argument("--headless", action="store_true", help="Disable the simulator visualization window.")
     parser.add_argument("--disable-com-visualization", action="store_true", help="Do not draw the desired COM marker.")
     parser.add_argument("--com-marker-radius", type=float, default=0.025, help="COM marker radius in meters.")
@@ -340,6 +377,7 @@ def main() -> int:
 
     selected_simulator_cfg = {
         "mujoco": simulator_defaults.mujoco,
+        "mjwarp": simulator_defaults.mjwarp,
         "isaacsim": simulator_defaults.isaacsim,
     }[args.simulator]
     simulator_fps = float(selected_simulator_cfg.config.sim.fps)
@@ -409,8 +447,10 @@ def main() -> int:
             f" wbc_dof={wbc_dof}"
             f" right_count={right_count}"
             f" right_contact={_format_tensor_row(env.simulator.right_foot_contact_position[0])}"
+            f" right_grf={_format_tensor_row(_foot_grf(env, term, 'right'))}"
             f" left_count={left_count}"
             f" left_contact={_format_tensor_row(env.simulator.left_foot_contact_position[0])}"
+            f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
         )
         # if right_count <= 0 or left_count <= 0:
         #     raise RuntimeError("G1 did not start in dual-foot contact after reset_all().")
@@ -437,7 +477,7 @@ def main() -> int:
             env.render()
 
             if hold_step_idx % args.print_every == 0 or _both_feet_in_contact(env.simulator):
-                _print_hold_summary(hold_step_idx, env)
+                _print_hold_summary(hold_step_idx, env, term)
 
         if not _both_feet_in_contact(env.simulator):
             raise RuntimeError(
@@ -496,7 +536,9 @@ def main() -> int:
             f" state={term.curr_state[0] if hasattr(term, 'curr_state') else None}"
             f" torque={_format_tensor_row(term.torques[0])}"
             f" right_basis={_format_tensor_row(env.simulator.right_foot_contact_basis[0])}"
+            f" right_grf={_format_tensor_row(_foot_grf(env, term, 'right'))}"
             f" left_basis={_format_tensor_row(env.simulator.left_foot_contact_basis[0])}"
+            f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
         )
         print("PASS: commanded one standing G1 environment through torque_control WBC.")
         return 0

@@ -61,7 +61,8 @@ class TrainingConfig:
     """Enable multi-GPU training."""
 
     # Environment settings
-    num_envs: int = 4096
+    # num_envs: int = 4096
+    num_envs: int = 1024
     """Number of parallel environments."""
 
     seed: int = 42

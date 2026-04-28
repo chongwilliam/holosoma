@@ -88,6 +88,13 @@ def root_state_to_base_velocity(root_state: torch.Tensor) -> torch.Tensor:
     """Return floating-base velocity as [linear_velocity, angular_velocity]."""
     return root_state[7:13]
 
+
+def root_states_to_xyz_rpy(root_states: torch.Tensor) -> torch.Tensor:
+    """Convert batched root states to [xyz, rx, ry, rz] for the control URDF floating joints."""
+    root_rotation = quaternion_to_matrix(root_states[:, 3:7], w_last=True)
+    rx_ry_rz = matrix_to_urdf_floating_xyz_angles(root_rotation)
+    return torch.cat([root_states[:, 0:3], rx_ry_rz], dim=-1)
+
 def parse_actions(actions: torch.Tensor) -> dict:
     """
     Convert action tensor to action mapping 
@@ -107,19 +114,19 @@ def parse_actions(actions: torch.Tensor) -> dict:
     #     "left_hand_ori": actions[36:43],
     # }
 
-    # Full action output
-    action_dict = {
-        "com_pos": actions[:3],
-        "pelvis_ori": actions[3:6],
-        "right_foot_pos": actions[6:9],
-        "right_foot_ori": actions[9:12],
-        "left_foot_pos": actions[12:15],
-        "left_foot_ori": actions[15:18],
-        "right_hand_pos": actions[18:21],
-        "right_hand_ori": actions[21:24],
-        "left_hand_pos": actions[24:27],
-        "left_hand_ori": actions[27:30],
-    }
+    # # Full action output
+    # action_dict = {
+    #     "com_pos": actions[:3],
+    #     "pelvis_ori": actions[3:6],
+    #     "right_foot_pos": actions[6:9],
+    #     "right_foot_ori": actions[9:12],
+    #     "left_foot_pos": actions[12:15],
+    #     "left_foot_ori": actions[15:18],
+    #     "right_hand_pos": actions[18:21],
+    #     "right_hand_ori": actions[21:24],
+    #     "left_hand_pos": actions[24:27],
+    #     "left_hand_ori": actions[27:30],
+    # }
 
     # # Minimal action output (com and feet position)
     # action_dict = {
@@ -128,17 +135,78 @@ def parse_actions(actions: torch.Tensor) -> dict:
     #     "left_foot_pos": actions[6:9],
     # }
 
-    # # Lower body action output 
-    # action_dict = {
-    #     "com_pos": actions[:3],
-    #     "pelvis_ori": actions[3:9],
-    #     "right_foot_pos": actions[9:12],
-    #     "right_foot_ori": actions[12:18],
-    #     "left_foot_pos": actions[18:21],
-    #     "left_foot_ori": actions[21:24],
-    # }
+    # Lower body action output
+    action_dict = {
+        "com_pos": actions[:3],
+        "pelvis_ori": actions[3:6],
+        "torso_ori": actions[6:9],
+        "right_foot_pos": actions[9:12],
+        "right_foot_ori": actions[12:15],
+        "left_foot_pos": actions[15:18],
+        "left_foot_ori": actions[18:21],
+    }
 
-    return action_dict 
+    return action_dict
+
+def skew(w):
+    """Convert a 3D vector to a skew-symmetric matrix."""
+    wx, wy, wz = w
+    return np.array([
+        [0.0, -wz,  wy],
+        [wz,  0.0, -wx],
+        [-wy, wx,  0.0]
+    ])
+
+def exp_map(omega):
+    theta = np.linalg.norm(omega)
+    w_hat = skew(omega)
+    w_hat_sq = w_hat @ w_hat
+
+    if theta < 1e-6:
+        # Use series expansion
+        A = 1 - theta**2 / 6 + theta**4 / 120
+        B = 0.5 - theta**2 / 24 + theta**4 / 720
+    else:
+        A = np.sin(theta) / theta
+        B = (1 - np.cos(theta)) / (theta ** 2)
+
+    R = np.eye(3) + A * w_hat + B * w_hat_sq
+    return R
+
+def apply_delta_rotation(R_current, omega):
+    return R_current @ exp_map(omega)
+
+### CLASS ###
+
+class _BatchedWbcFacade:
+    """Small compatibility shim around humanoid_wbc.BatchedWbcController."""
+
+    def __init__(self, controller: Any, dof: int, debug_engine: Any | None = None):
+        self._controller = controller
+        self._dof = dof
+        self._debug_engine = debug_engine
+
+    def dof(self) -> int:
+        return self._dof
+
+    def setTotalTransitionTime(self, seconds: float) -> None:
+        self._controller.setTotalTransitionTime(seconds)
+        if self._debug_engine is not None:
+            self._debug_engine.setTotalTransitionTime(seconds)
+
+    def reset_state(self, state: Any | None = None, transition_start_time: float = 0.0) -> None:
+        if state is None:
+            self._controller.reset_state()
+            return
+        self._controller.reset_state(state, transition_start_time)
+
+    def compute_torques_batch(self, *args: Any, **kwargs: Any) -> Any:
+        return self._controller.compute_torques_batch(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        if self._debug_engine is not None and hasattr(self._debug_engine, name):
+            return getattr(self._debug_engine, name)
+        return getattr(self._controller, name)
 
 
 class JointTorqueActionTerm(ActionTermBase):
@@ -162,8 +230,10 @@ class JointTorqueActionTerm(ActionTermBase):
         """
         super().__init__(cfg, env)
 
-        # Get action dimension from environment
-        self._action_dim = env.num_dof
+        # Policy actions may be task-space commands, while the controller still outputs
+        # one torque per actuated DOF.
+        self._action_dim = env.robot_config.actions_dim
+        self._torque_dim = env.num_dof
 
         # Initialize action buffers
         self._raw_actions = torch.zeros(env.num_envs, self._action_dim, device=env.device)
@@ -171,23 +241,23 @@ class JointTorqueActionTerm(ActionTermBase):
         self._actions_after_delay = torch.zeros(env.num_envs, self._action_dim, device=env.device)
 
         # Initialize torque buffer
-        self.torques = torch.zeros(env.num_envs, self._action_dim, device=env.device)
+        self.torques = torch.zeros(env.num_envs, self._torque_dim, device=env.device)
 
         # Cache previous DOF velocities for derivative control
         self._prev_dof_vel = torch.zeros(env.num_envs, env.num_dof, device=env.device)
 
         # Default actuator scaling (may be overridden by randomization terms)
-        self._kp_scale = torch.ones(env.num_envs, self._action_dim, device=env.device)
+        self._kp_scale = torch.ones(env.num_envs, self._torque_dim, device=env.device)
         self._kd_scale = torch.ones_like(self._kp_scale)
         self._rfi_lim_scale = torch.ones_like(self._kp_scale)
         self._rfi_lim: float = 0.0
         self._randomize_torque_rfi: bool = False
 
-        # PD gains and action scales
-        self.p_gains = torch.zeros(self._action_dim, dtype=torch.float, device=env.device)
+        # PD gains are per actuator; action scales are per policy action.
+        self.p_gains = torch.zeros(self._torque_dim, dtype=torch.float, device=env.device)
         self.d_gains = torch.zeros_like(self.p_gains)
         self.i_gains = torch.zeros_like(self.p_gains)
-        self.action_scales = torch.zeros_like(self.p_gains)
+        self.action_scales = torch.zeros(self._action_dim, dtype=torch.float, device=env.device)
 
         self._configure_pd_gains(env)
         self._configure_action_scales(env)
@@ -205,18 +275,20 @@ class JointTorqueActionTerm(ActionTermBase):
         self._last_wbc_q = torch.zeros(env.num_envs, env.num_dof + 6, device=env.device)
         self._last_wbc_root_state = torch.zeros(env.num_envs, 13, device=env.device)
         self._last_wbc_dof_pos = torch.zeros(env.num_envs, env.num_dof, device=env.device)
-        self._wbc_module = self._import_wbc_module(cfg.wbc_extension_dir)
+        resolved_extension_dir = self._resolve_wbc_extension_dir(cfg.wbc_extension_dir)
+        resolved_params = self._resolve_wbc_params(env, cfg.params, resolved_extension_dir)
+        self._wbc_module = self._import_wbc_module(resolved_extension_dir)
         self.State = self._wbc_module.State
         self.Phase = self._wbc_module.Phase
-        self.wbc = [
-            self._create_wbc_engine(cfg.wbc_extension_dir, cfg.params, self._wbc_module)
-            for _ in range(env.num_envs)
-        ]
+        self._batched_wbc = self._create_batched_wbc_controller(
+            resolved_extension_dir, resolved_params, env.num_envs, self._wbc_module
+        )
+        self._wbc_debug_engine = self._create_wbc_engine(resolved_extension_dir, resolved_params, self._wbc_module)
+        self.wbc = _BatchedWbcFacade(self._batched_wbc, int(self._wbc_debug_engine.dof()), self._wbc_debug_engine)
         self.curr_state = [self.State.DUAL_STANCE for _ in range(env.num_envs)]
         self._prev_wbc_state: Any | None = None
         self.transition_start_time = [0.0 for _ in range(env.num_envs)]
-        for i in range(env.num_envs):
-            self.wbc[i].setTotalTransitionTime(0.15)  # hard-coded for now
+        self.wbc.setTotalTransitionTime(0.15)  # hard-coded for now
 
     def setup(self) -> None:
         """Setup action term after all managers are initialized.
@@ -346,159 +418,62 @@ class JointTorqueActionTerm(ActionTermBase):
             actions: Action tensor [num_envs, action_dim]
 
         Returns:
-            Torque tensor [num_envs, action_dim]
+            Torque tensor [num_envs, num_dof]
         """
         num_envs = actions.shape[0]
-        torques = torch.zeros(num_envs, self._action_dim, device=actions.device, dtype=self.torques.dtype)
+        if num_envs != self.env.num_envs:
+            raise RuntimeError(
+                "BatchedWbcController requires one action row per environment. "
+                f"Got actions.shape[0]={num_envs}, env.num_envs={self.env.num_envs}."
+            )
+
         action_scale = float(self.env.robot_config.control.action_scale)
 
-        for env_idx in range(num_envs):
-            root_state = self.env.simulator.robot_root_states[env_idx]
-            q_tensor = torch.cat([root_state_to_xyz_rpy(root_state), self.env.simulator.dof_pos[env_idx]], dim=0)
-            dq_tensor = torch.cat([root_state_to_base_velocity(root_state), self.env.simulator.dof_vel[env_idx]], dim=0)
-            q = q_tensor.detach().cpu().numpy()
-            dq = dq_tensor.detach().cpu().numpy()
-            self._last_wbc_q[env_idx] = q_tensor
-            self._last_wbc_root_state[env_idx] = root_state
-            self._last_wbc_dof_pos[env_idx] = self.env.simulator.dof_pos[env_idx]
-            self.wbc[env_idx].updateRobot(q, dq)
+        root_states = self._as_torch_tensor(
+            self.env.simulator.robot_root_states, device=actions.device, dtype=torch.float32, label="root_states"
+        )
+        dof_pos = self._as_torch_tensor(
+            self.env.simulator.dof_pos, device=actions.device, dtype=torch.float32, label="dof_pos"
+        )
+        dof_vel = self._as_torch_tensor(
+            self.env.simulator.dof_vel, device=actions.device, dtype=torch.float32, label="dof_vel"
+        )
+        q_tensor = torch.cat([root_states_to_xyz_rpy(root_states), dof_pos], dim=1)
+        dq_tensor = torch.cat([root_states[:, 7:13], dof_vel], dim=1)
 
-            # Get contact state from control from humanoid
-            # right_contact_count = int(self.env.simulator.right_foot_contact_count[env_idx].item())
-            # left_contact_count = int(self.env.simulator.left_foot_contact_count[env_idx].item())
-            # if right_contact_count > 0 and left_contact_count > 0:
-            #     curr_state = self.State.DUAL_STANCE
-            # elif right_contact_count > 0:
-            #     curr_state = self.State.RIGHT_STANCE
-            # elif left_contact_count > 0:
-            #     curr_state = self.State.LEFT_STANCE
-            # else:
-            #     curr_state = self.State.FLOATING
+        self._last_wbc_q[:num_envs] = q_tensor
+        self._last_wbc_root_state[:num_envs] = root_states
+        self._last_wbc_dof_pos[:num_envs] = dof_pos
 
-            # if curr_state != self._prev_wbc_state:
-            #     self.wbc[env_idx].reInitializeTask(curr_state)
-            #     self._prev_wbc_state = curr_state
+        right_contact_points = self._as_numpy_2d(self.env.simulator.right_foot_contact_position, "right_contact_points")
+        left_contact_points = self._as_numpy_2d(self.env.simulator.left_foot_contact_position, "left_contact_points")
+        right_contact_bases = self._contact_bases_as_numpy(self.env.simulator.right_foot_contact_basis, "right_contact_bases")
+        left_contact_bases = self._contact_bases_as_numpy(self.env.simulator.left_foot_contact_basis, "left_contact_bases")
+        right_grfs = self._batched_foot_ground_reaction_wrenches("right")
+        left_grfs = self._batched_foot_ground_reaction_wrenches("left")
 
-            # Revised contact state information and logic
-            right_contact_point = self.env.simulator.right_foot_contact_position[env_idx].detach().cpu().numpy()
-            left_contact_point = self.env.simulator.left_foot_contact_position[env_idx].detach().cpu().numpy()
-            right_contact_basis = np.diag(
-                self.env.simulator.right_foot_contact_basis[env_idx].detach().cpu().numpy().astype(float)
-            )
-            left_contact_basis = np.diag(
-                self.env.simulator.left_foot_contact_basis[env_idx].detach().cpu().numpy().astype(float)
-            )
-            right_foot_grf = self._foot_ground_reaction_wrench(env_idx, "right")
-            left_foot_grf = self._foot_ground_reaction_wrench(env_idx, "left")
-
-            print("right grf: ", right_foot_grf)
-            print("left grf: ", left_foot_grf)
-
-            # # debug force basis
-            # right_contact_basis = np.eye(3)
-            # left_contact_basis = np.eye(3)
-
-            # Update stance support from contact information
-            self.wbc[env_idx].updateStanceSupport(
-                self.State.NUM_STATES,
-                right_contact_point,
-                right_contact_basis,
-                left_contact_point,
-                left_contact_basis,
-            )
-
-            self._draw_stance_support(
-                env_idx,
-                right_contact_point,
-                right_contact_basis,
-                "right",
-                left_contact_point,
-                left_contact_basis,
-                "left",
-            )
-
-            # Query the stance switching logic
-
-            # hard-coded for now
-            dual_to_single_counter_threshold = 10
-            single_to_dual_counter_threshold = 10
-            single_to_dual_force_threshold = 20  # N
-
-            curr_state = self.curr_state[env_idx]
-            if curr_state == self.State.DUAL_STANCE:
-                self.curr_state[env_idx] = self.wbc[env_idx].getContactTransitionFromDualStance(
-                    right_foot_grf, left_foot_grf, dual_to_single_counter_threshold
-                )
-            elif curr_state in (self.State.LEFT_STANCE, self.State.RIGHT_STANCE):
-                self.curr_state[env_idx] = self.wbc[env_idx].getContactTransitionFromSingleStance(
-                    curr_state,
-                    right_foot_grf,
-                    left_foot_grf,
-                    single_to_dual_force_threshold,
-                    single_to_dual_counter_threshold
-                )
-
-            # debug
-            print("Current state: ", self.curr_state[env_idx])
-
-            # # Debug: force dual stance 
-            # self.curr_state[env_idx] = self.State.DUAL_STANCE
-
-            # Get current pose
-            com_pose = np.asarray(self.wbc[env_idx].getPose("com"), dtype=float) # matrix
-            torso_pose = np.asarray(self.wbc[env_idx].getPose("torso"), dtype=float)
-            pelvis_rotation = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)            
-            right_foot_pose = np.asarray(self.wbc[env_idx].getPose("right_foot"), dtype=float)
-            left_foot_pose = np.asarray(self.wbc[env_idx].getPose("left_foot"), dtype=float)
-
-            # Get actions and set targets
-            action_dict = parse_actions(actions[env_idx] * action_scale)
-            targets = self._wbc_module.WbcDesiredTargets()
-
-            com_pos = action_dict["com_pos"].detach().cpu().numpy() + com_pose[:3, 3]
-            pelvis_ori = axis_angle_to_matrix(action_dict["pelvis_ori"].detach().cpu().numpy()) @ pelvis_rotation
-            torso_ori = torso_pose[:3, :3]
-            right_foot_pos = action_dict["right_foot_pos"].detach().cpu().numpy() + right_foot_pose[:3, 3]
-            right_foot_ori = axis_angle_to_matrix(action_dict["right_foot_ori"].detach().cpu().numpy()) @ right_foot_pose[:3, :3]
-            left_foot_pos = action_dict["left_foot_pos"].detach().cpu().numpy() + left_foot_pose[:3, 3]
-            left_foot_ori = axis_angle_to_matrix(action_dict["left_foot_ori"].detach().cpu().numpy()) @ left_foot_pose[:3, :3]
-
-            # com and feet actions for now
-            targets.com.position = com_pos
-            targets.pelvis.orientation = pelvis_ori
-            targets.torso.orientation = torso_ori
-            targets.right_foot.position = right_foot_pos
-            targets.right_foot.orientation = right_foot_ori
-            targets.left_foot.position = left_foot_pos
-            targets.left_foot.orientation = left_foot_ori
-
-            # # hand actions
-            # targets.right_hand.position = right_hand_pos 
-            # targets.right_hand.orientation = right_hand_ori 
-            # targets.left_hand.position = left_hand_pos 
-            # targets.left_hand.orientation = left_hand_ori
-
-            # Compute torques
-            # Stance transition torques
-            sim_time = self.env.simulator.time()
-            if self.curr_state[env_idx] not in (self.State.DUAL_STANCE, self.State.LEFT_STANCE, self.State.RIGHT_STANCE):
-                normalized_time = (sim_time - self.transition_start_time[env_idx]) / self.wbc[env_idx].getTotalTransitionTime()
-                normalized_time = min(max(normalized_time, 0.0), 1.0)
-                transition_done, torque_wbc = self.wbc[env_idx].computeContactTransferOutput(self._wbc_module.getPhaseFromState(self.curr_state[env_idx]), normalized_time)
-                torque_np = self._actuated_torques_from_wbc_output(torque_wbc)
-                if transition_done:
-                    # Transition to next state
-                    self.curr_state[env_idx] = self._wbc_module.getNextStateFromTransition(self.curr_state[env_idx])
-            else:
-                self.transition_start_time[env_idx] = sim_time
-                torque_np = self._actuated_torques_from_wbc_output(
-                    self.wbc[env_idx].compute(
-                        self.curr_state[env_idx],
-                        targets
-                    )
-                )
-
-            torques[env_idx] = torch.as_tensor(torque_np, device=actions.device, dtype=self.torques.dtype)
+        q = self._as_numpy_2d(q_tensor, "q")
+        dq = self._as_numpy_2d(dq_tensor, "dq")
+        action_batch = self._actions_for_batched_wbc(actions)
+        self._wbc_debug_engine.updateRobot(q[0], dq[0])
+        torque_wbc = self.wbc.compute_torques_batch(
+            q,
+            dq,
+            action_batch,
+            right_contact_points,
+            right_contact_bases,
+            left_contact_points,
+            left_contact_bases,
+            right_grfs,
+            left_grfs,
+            float(self.env.simulator.time()),
+            action_scale,
+        )
+        torques = torch.as_tensor(
+            self._actuated_torques_from_batched_wbc_output(torque_wbc),
+            device=actions.device,
+            dtype=self.torques.dtype,
+        )
 
         # Scale actions
         # actions_scaled = actions * self.action_scales
@@ -537,17 +512,75 @@ class JointTorqueActionTerm(ActionTermBase):
 
         return torques
 
+    def _as_torch_tensor(self, value: Any, *, device: torch.device | str, dtype: torch.dtype, label: str) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif getattr(value, "_is_tensor_proxy", False):
+            tensor = value[:]
+        else:
+            tensor = torch.as_tensor(value)
+        if not isinstance(tensor, torch.Tensor):
+            tensor = torch.as_tensor(tensor)
+        return tensor.to(device=device, dtype=dtype)
+
+    def _as_numpy_2d(self, value: Any, label: str) -> np.ndarray:
+        tensor = self._as_torch_tensor(value, device="cpu", dtype=torch.float64, label=label)
+        array = tensor.detach().cpu().numpy().astype(np.float64, copy=False)
+        if array.ndim != 2:
+            raise RuntimeError(f"{label} must be rank 2, got shape {array.shape}.")
+        return np.ascontiguousarray(array)
+
+    def _actions_for_batched_wbc(self, actions: torch.Tensor) -> np.ndarray:
+        if actions.shape[1] != 21:
+            return self._as_numpy_2d(actions, "actions")
+
+        # Locomotion policy layout:
+        # [com_pos, pelvis_ori, torso_ori, right_foot_pos/ori, left_foot_pos/ori].
+        return self._as_numpy_2d(actions, "actions")
+
+    def _contact_bases_as_numpy(self, value: Any, label: str) -> np.ndarray:
+        tensor = self._as_torch_tensor(value, device=self.env.device, dtype=torch.float32, label=label)
+        if tensor.dim() == 2 and tensor.shape[-1] == 3:
+            tensor = torch.diag_embed(tensor)
+        if tensor.dim() != 3 or tensor.shape[-2:] != (3, 3):
+            raise RuntimeError(f"{label} must have shape [num_envs, 3] or [num_envs, 3, 3], got {tuple(tensor.shape)}.")
+        return np.ascontiguousarray(tensor.cpu().numpy().astype(np.float64, copy=False))
+
+    def _batched_foot_ground_reaction_wrenches(self, side: str) -> np.ndarray:
+        grfs = np.stack(
+            [self._foot_ground_reaction_wrench(env_idx, side) for env_idx in range(self.env.num_envs)],
+            axis=0,
+        ).astype(np.float64, copy=False)
+        force_norms = np.linalg.norm(grfs[:, :3], axis=1)
+        grfs[force_norms < 20.0] = 0.0
+        return np.ascontiguousarray(grfs)
+
+    def _actuated_torques_from_batched_wbc_output(self, torque_wbc: Any) -> np.ndarray:
+        """Normalize batched WBC torque output to simulator actuated DOF torques."""
+        torque_np = np.asarray(torque_wbc, dtype=float)
+        if torque_np.ndim != 2:
+            raise RuntimeError(f"Unexpected batched WBC torque rank: got shape {torque_np.shape}.")
+        if torque_np.shape[1] == self._torque_dim:
+            return torque_np
+        if torque_np.shape[1] == self._torque_dim + 6:
+            return torque_np[:, 6:]
+        raise RuntimeError(
+            "Unexpected batched WBC torque output size: "
+            f"got shape {torque_np.shape}, expected {self._torque_dim} actuated torques "
+            f"or {self._torque_dim + 6} floating-base torques per environment."
+        )
+
     def _actuated_torques_from_wbc_output(self, torque_wbc: Any) -> np.ndarray:
         """Normalize WBC torque output to simulator actuated DOF torques."""
         torque_np = np.asarray(torque_wbc, dtype=float).reshape(-1)
-        if torque_np.shape[0] == self._action_dim:
+        if torque_np.shape[0] == self._torque_dim:
             return torque_np
-        if torque_np.shape[0] == self._action_dim + 6:
+        if torque_np.shape[0] == self._torque_dim + 6:
             return torque_np[6:]
         raise RuntimeError(
             "Unexpected WBC torque output size: "
-            f"got {torque_np.shape[0]}, expected {self._action_dim} actuated torques "
-            f"or {self._action_dim + 6} floating-base torques."
+            f"got {torque_np.shape[0]}, expected {self._torque_dim} actuated torques "
+            f"or {self._torque_dim + 6} floating-base torques."
         )
 
     def _draw_stance_support(
@@ -597,15 +630,13 @@ class JointTorqueActionTerm(ActionTermBase):
 
         simulator = self.env.simulator
         foot_body_idx = self._foot_body_indices[side]
+        mujoco_body_map = getattr(simulator, "holosoma_to_mujoco_body_map", None)
+        rigid_body_idx = foot_body_idx
+        if isinstance(mujoco_body_map, dict):
+            rigid_body_idx = mujoco_body_map.get(foot_body_idx, foot_body_idx)
 
-        # hard-code the body ID for ankle_roll_link
-        if side == 'right':
-            foot_body_idx = 14
-        elif side == 'left':
-            foot_body_idx = 7
-        
-        foot_pos_w = simulator._rigid_body_pos[env_idx, foot_body_idx]
-        foot_quat_w = simulator._rigid_body_rot[env_idx, foot_body_idx]
+        foot_pos_w = simulator._rigid_body_pos[env_idx, rigid_body_idx]
+        foot_quat_w = simulator._rigid_body_rot[env_idx, rigid_body_idx]
         self._assert_foot_pose_matches_wbc(env_idx, side, foot_pos_w, foot_quat_w, contact_point)
 
         local_contact_point = torch.as_tensor(contact_point[:3], device=foot_pos_w.device, dtype=foot_pos_w.dtype)
@@ -641,8 +672,9 @@ class JointTorqueActionTerm(ActionTermBase):
     ) -> None:
         # foot_name = f"{side}_foot"
         foot_name = f"{side}_ankle_roll_link"
-        wbc_pos = np.asarray(self.wbc[env_idx].getPosition(foot_name, local_contact_point), dtype=float).reshape(-1)[:3]
-        wbc_rot = np.asarray(self.wbc[env_idx].getRotation(foot_name), dtype=float)
+        wbc_engine = self._wbc_debug_engine
+        wbc_pos = np.asarray(wbc_engine.getPosition(foot_name, local_contact_point), dtype=float).reshape(-1)[:3]
+        wbc_rot = np.asarray(wbc_engine.getRotation(foot_name), dtype=float)
         if wbc_pos.shape[0] < 3 or not np.all(np.isfinite(wbc_pos)):
             raise AssertionError(f"WBC {foot_name} position is invalid: shape={wbc_pos.shape}, pos={wbc_pos}")
         if wbc_rot.shape != (3, 3) or not np.all(np.isfinite(wbc_rot)):
@@ -689,8 +721,8 @@ class JointTorqueActionTerm(ActionTermBase):
         self,
         env_idx: int,
     ) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
-        wbc_pelvis_pos = np.asarray(self.wbc[env_idx].getPosition("pelvis"), dtype=float).reshape(-1)
-        wbc_pelvis_rot = np.asarray(self.wbc[env_idx].getRotation("pelvis"), dtype=float)
+        wbc_pelvis_pos = np.asarray(self._wbc_debug_engine.getPosition("pelvis"), dtype=float).reshape(-1)
+        wbc_pelvis_rot = np.asarray(self._wbc_debug_engine.getRotation("pelvis"), dtype=float)
         if wbc_pelvis_pos.shape[0] < 3 or not np.all(np.isfinite(wbc_pelvis_pos)):
             raise AssertionError(f"WBC pelvis position is invalid: shape={wbc_pelvis_pos.shape}, pos={wbc_pelvis_pos}")
         if wbc_pelvis_rot.shape != (3, 3) or not np.all(np.isfinite(wbc_pelvis_rot)):
@@ -776,6 +808,7 @@ class JointTorqueActionTerm(ActionTermBase):
         # Reset cached velocities
         if env_ids is None:
             self._prev_dof_vel.zero_()
+            self.wbc.reset_state(int(self.State.DUAL_STANCE), 0.0)
         else:
             self._prev_dof_vel[env_ids] = 0.0
 
@@ -858,21 +891,19 @@ class JointTorqueActionTerm(ActionTermBase):
         if callable(sensor_wrench_fn):
             try:
                 return sensor_wrench_fn(side, env_idx).detach().cpu().numpy().astype(float, copy=False)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to read foot force/torque sensor wrench via "
+                    f"env.simulator.get_foot_force_sensor_wrench(side={side!r}, env_idx={env_idx}). "
+                    "Refusing to fall back to env.simulator.contact_forces because the WBC expects the "
+                    "XML foot force sensor wrench in [force; torque] order."
+                ) from exc
 
-        contact_wrench = (
-            self.env.simulator.contact_forces[env_idx, self._foot_body_indices[side]]
-            .detach()
-            .cpu()
-            .numpy()
+        raise RuntimeError(
+            "env.simulator does not provide get_foot_force_sensor_wrench(). "
+            "Refusing to fall back to env.simulator.contact_forces because the WBC expects the XML foot "
+            "force sensor wrench in [force; torque] order."
         )
-        if contact_wrench.shape[0] >= 6:
-            return contact_wrench[:6].astype(float, copy=False)
-
-        wrench = np.zeros(6, dtype=float)
-        wrench[: min(3, contact_wrench.shape[0])] = contact_wrench[:3]
-        return wrench
 
     def _attach_actuator_randomizer_scales(self) -> None:
         """Attach shared actuator randomizer buffers if they exist."""
@@ -919,6 +950,11 @@ class JointTorqueActionTerm(ActionTermBase):
     def _configure_action_scales(self, env: Any) -> None:
         control_cfg = env.robot_config.control
         if control_cfg.action_scales_by_effort_limit_over_p_gain:
+            if self._action_dim != self._torque_dim:
+                raise ValueError(
+                    "action_scales_by_effort_limit_over_p_gain requires policy action dim to match num_dof. "
+                    f"Got actions_dim={self._action_dim}, num_dof={self._torque_dim}."
+                )
             dof_effort_limit_list = env.robot_config.dof_effort_limit_list
             for i, effort in enumerate(dof_effort_limit_list):
                 stiffness = self.p_gains[i]
@@ -931,7 +967,56 @@ class JointTorqueActionTerm(ActionTermBase):
 
     # WBC import helpers
     def _repo_root(self) -> Path:
-        return Path(__file__).resolve().parents[1]
+        path = Path(__file__).resolve()
+        candidates = [path.parent, *path.parents]
+
+        for candidate in candidates:
+            if (candidate.parent / "humanoid-control").exists():
+                return candidate
+
+        for candidate in candidates:
+            if (candidate / ".git").exists():
+                return candidate
+
+        pyproject_candidates = [candidate for candidate in candidates if (candidate / "pyproject.toml").exists()]
+        for candidate in reversed(pyproject_candidates):
+            if (candidate / "src" / "holosoma").exists():
+                return candidate
+
+        if pyproject_candidates:
+            return pyproject_candidates[-1]
+
+        return path.parents[6]
+
+    def _humanoid_control_root(self) -> Path:
+        return self._repo_root().parent / "humanoid-control"
+
+    def _resolve_wbc_extension_dir(self, extension_dir: str | None = None) -> str | None:
+        if extension_dir:
+            return str(Path(extension_dir).expanduser().resolve())
+
+        humanoid_control_build = self._humanoid_control_root() / "build"
+        if humanoid_control_build.exists():
+            return str(humanoid_control_build.resolve())
+
+        return None
+
+    def _resolve_wbc_params(
+        self, env: Any, params: dict[str, Any], extension_dir: str | None = None
+    ) -> dict[str, Any]:
+        resolved_params = dict(params)
+        robot_type = getattr(env.robot_config.asset, "robot_type", "")
+
+        if not robot_type.startswith("g1"):
+            return resolved_params
+
+        robot_data_root = self._repo_root() / "src" / "holosoma" / "holosoma" / "data" / "robots" / "g1"
+        humanoid_control_root = self._humanoid_control_root()
+
+        resolved_params.setdefault("robot_file", str((humanoid_control_root / "models" / "unitree_g1" / "g1.urdf").resolve()))
+        resolved_params.setdefault("yaml_file", str((humanoid_control_root / "params" / "g1_parameters.yaml").resolve()))
+        resolved_params.setdefault("robot_name", "g1")
+        return resolved_params
 
     def _extension_root(self, extension_dir: str | None = None) -> Path:
         if extension_dir:
@@ -939,6 +1024,9 @@ class JointTorqueActionTerm(ActionTermBase):
             if resolved.name == "build":
                 return resolved.parent
             return resolved
+        humanoid_control_root = self._humanoid_control_root()
+        if humanoid_control_root.exists():
+            return humanoid_control_root
         return self._repo_root()
 
     def _try_add_local_extension_path(self, module_name: str, extension_dir: str | None = None) -> None:
@@ -952,7 +1040,15 @@ class JointTorqueActionTerm(ActionTermBase):
         search_roots = []
         if extension_dir:
             search_roots.append(Path(extension_dir).expanduser().resolve())
-        search_roots.extend([self._repo_root() / "build", self._repo_root()])
+        humanoid_control_root = self._humanoid_control_root()
+        search_roots.extend(
+            [
+                humanoid_control_root / "build",
+                humanoid_control_root,
+                self._repo_root() / "build",
+                self._repo_root(),
+            ]
+        )
 
         candidates: list[Path] = []
         for base in search_roots:
@@ -983,11 +1079,11 @@ class JointTorqueActionTerm(ActionTermBase):
                     "inside the active Python environment."
                 ) from fallback_error
 
-    def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any], wbc_module: Any | None = None):
-        if wbc_module is None:
-            wbc_module = self._import_wbc_module(extension_dir)
+    def _resolve_wbc_asset_paths(
+        self, extension_dir: str | None, params: dict[str, Any]
+    ) -> tuple[Path, Path, str]:
         extension_root = self._extension_root(extension_dir)
-        robot_file = Path(params.get("robot_file", extension_root / "models" / "hrp4c" / "HRP4c.urdf"))
+        robot_file = Path(params.get("robot_file", extension_root / "models" / "unitree_g1" / "g1.urdf"))
         yaml_file = Path(params.get("yaml_file", extension_root / "params" / "hrp4c_parameters.yaml"))
         robot_name = params.get("robot_name", "hrp4c")
 
@@ -997,4 +1093,29 @@ class JointTorqueActionTerm(ActionTermBase):
                 f"robot_file={robot_file}, yaml_file={yaml_file}"
             )
 
+        return robot_file, yaml_file, robot_name
+
+    def _create_batched_wbc_controller(
+        self,
+        extension_dir: str | None,
+        params: dict[str, Any],
+        num_envs: int,
+        wbc_module: Any | None = None,
+    ):
+        if wbc_module is None:
+            wbc_module = self._import_wbc_module(extension_dir)
+        if not hasattr(wbc_module, "BatchedWbcController"):
+            raise RuntimeError(
+                "humanoid_wbc.BatchedWbcController is required for batched torque control, "
+                "but the imported humanoid_wbc module does not expose it. Rebuild humanoid-control "
+                "so the Python extension includes the batched controller bindings."
+            )
+
+        robot_file, yaml_file, robot_name = self._resolve_wbc_asset_paths(extension_dir, params)
+        return wbc_module.BatchedWbcController(str(robot_file), str(yaml_file), robot_name, int(num_envs))
+
+    def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any], wbc_module: Any | None = None):
+        if wbc_module is None:
+            wbc_module = self._import_wbc_module(extension_dir)
+        robot_file, yaml_file, robot_name = self._resolve_wbc_asset_paths(extension_dir, params)
         return wbc_module.WbcEngine(str(robot_file), str(yaml_file), robot_name)

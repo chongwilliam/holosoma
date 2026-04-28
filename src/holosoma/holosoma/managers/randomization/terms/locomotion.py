@@ -9,7 +9,6 @@ import torch
 from loguru import logger
 
 from holosoma.config_types.simulator import MujocoBackend
-from holosoma.managers.action.terms.joint_control import JointPositionActionTerm
 from holosoma.managers.randomization.base import RandomizationTermBase
 from holosoma.managers.randomization.exceptions import RandomizerNotSupportedError
 from holosoma.simulator import mujoco_required_field
@@ -31,22 +30,26 @@ def _ensure_env_ids_tensor(env: Any, env_ids: torch.Tensor | Sequence[int] | Non
     return torch.as_tensor(list(env_ids), device=env.device, dtype=torch.long)
 
 
-def _get_joint_action_term(env: Any) -> JointPositionActionTerm | None:
-    """Return the joint-position action term registered with the action manager."""
+def _get_joint_action_term(env: Any) -> Any | None:
+    """Return an action term that supports actuator scale sharing."""
     action_manager = getattr(env, "action_manager", None)
     if action_manager is None:
         return None
 
     get_term = getattr(action_manager, "get_term", None)
     if callable(get_term):
-        term = get_term("joint_control")
-        if isinstance(term, JointPositionActionTerm):
-            return term
+        for term_name in ("joint_control", "torque_control"):
+            try:
+                term = get_term(term_name)
+            except KeyError:
+                continue
+            if hasattr(term, "attach_actuator_scales"):
+                return term
 
     iter_terms = getattr(action_manager, "iter_terms", None)
     if callable(iter_terms):
         for _, term in iter_terms():
-            if isinstance(term, JointPositionActionTerm):
+            if hasattr(term, "attach_actuator_scales"):
                 return term
 
     return None
@@ -283,7 +286,7 @@ class ActuatorRandomizerState(RandomizationTermBase):
             term.attach_actuator_scales(self.kp_scale, self.kd_scale, self.rfi_lim_scale)
         else:
             logger.debug(
-                "JointPositionActionTerm not ready during ActuatorRandomizerState.setup(); "
+                "Compatible action term not ready during ActuatorRandomizerState.setup(); "
                 "the term will attach shared actuator scales once its setup() runs."
             )
 

@@ -43,10 +43,10 @@ class MujocoWarpConfig:
     Memory scales as: num_envs x nconmax_per_env
     """
 
-    njmax_per_env: int | None = None
-    """Maximum constraints per environment (default: auto-calculated).
+    njmax_per_env: int | None = 10000
+    """Maximum constraints per environment (default: 10000).
 
-    If None (default), automatically calculated as: max(nconmax * 6, nv * 4)
+    If None, automatically calculated as: max(nconmax * 6, nv * 4)
     where nv is the model's velocity dimension.
 
     Constraints include:

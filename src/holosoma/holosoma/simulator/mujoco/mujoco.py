@@ -275,19 +275,32 @@ class MuJoCo(BaseSimulator):
 
         force_sensor_name = f"{side}_ankle_roll_force"
         torque_sensor_name = f"{side}_ankle_roll_torque"
-        site_name = f"{side}_ankle_roll_force_site"
-
         force_sensor_id = self._lookup_mujoco_named_id(mujoco.mjtObj.mjOBJ_SENSOR, force_sensor_name)
         torque_sensor_id = self._lookup_mujoco_named_id(mujoco.mjtObj.mjOBJ_SENSOR, torque_sensor_name)
-        site_id = self._lookup_mujoco_named_id(mujoco.mjtObj.mjOBJ_SITE, site_name)
 
-        if force_sensor_id == -1 or torque_sensor_id == -1 or site_id == -1:
+        if force_sensor_id < 0 or torque_sensor_id < 0:
+            available = [
+                mujoco.mj_id2name(self.root_model, mujoco.mjtObj.mjOBJ_SENSOR, i)
+                for i in range(self.root_model.nsensor)
+            ]
+            robot_model_path = getattr(self.scene_manager, "robot_model_path", "<unknown>")
+            robot_prefix = getattr(self.scene_manager, "robot_prefix", "<unknown>")
             raise KeyError(
                 f"Missing MuJoCo foot force sensor metadata for side='{side}': "
-                f"force_sensor_id={force_sensor_id}, torque_sensor_id={torque_sensor_id}, site_id={site_id}"
+                f"expected force='{force_sensor_name}', torque='{torque_sensor_name}', "
+                f"got force_sensor_id={force_sensor_id}, torque_sensor_id={torque_sensor_id}. "
+                f"robot_model_path='{robot_model_path}', robot_prefix='{robot_prefix}', "
+                f"nsensor={self.root_model.nsensor}. Available sensors: {available}"
+            )
+
+        if force_sensor_id == -1 or torque_sensor_id == -1:
+            raise KeyError(
+                f"Missing MuJoCo foot force sensor metadata for side='{side}': "
+                f"force_sensor_id={force_sensor_id}, torque_sensor_id={torque_sensor_id}"
             )
 
         assert self.root_model
+        site_id = int(self.root_model.sensor_objid[force_sensor_id])
         metadata = {
             "force_sensor_id": force_sensor_id,
             "torque_sensor_id": torque_sensor_id,
@@ -894,65 +907,88 @@ class MuJoCo(BaseSimulator):
             self.contact_forces_history[env_ids, :, :, :] = 0.0
 
     def _update_foot_contact_summary(self) -> None:
-        """Compute foot contact barycenters and supported axes from MuJoCo contacts."""
+        """Compute per-foot contact summary from foot force sensors via center of pressure."""
         self._clear_foot_contact_buffers()
 
-        if self.simulator_config.mujoco_backend != MujocoBackend.CLASSIC:
-            if not self._mujoco_contact_support_warning_emitted:
-                logger.warning(
-                    "Foot contact barycenter/support extraction is only implemented for MuJoCo ClassicBackend. "
-                    "Warp backend will report zeros."
-                )
-                self._mujoco_contact_support_warning_emitted = True
-                exit(0)
-            return
+        if self.simulator_config.mujoco_backend == MujocoBackend.WARP:
+            if not hasattr(self.backend, "sensordata_t"):
+                raise RuntimeError("MuJoCo WarpBackend does not expose force sensor tensors.")
+            sensordata_by_env = self.backend.sensordata_t  # type: ignore[attr-defined]
+        else:
+            assert self.root_data is not None
+            sensordata_by_env = torch.from_numpy(self.root_data.sensordata).to(
+                device=self.sim_device, dtype=torch.float32
+            ).unsqueeze(0)
 
-        assert self.root_model
-        assert self.root_data
+        foot_center = torch.tensor(self.robot_config.foot_center, device=self.sim_device, dtype=torch.float32)
+        half_length = 0.5 * float(self.robot_config.foot_dimension[0])
+        half_width = 0.5 * float(self.robot_config.foot_dimension[1])
+        eps = float(self.simulator_config.contact_support.eps)
+        normal_force_threshold = 1.0
 
-        foot_world_points: dict[str, list[torch.Tensor]] = {"right": [], "left": []}
-        for contact_idx in range(self.root_data.ncon):
-            contact = self.root_data.contact[contact_idx]
-            for geom_id in (contact.geom1, contact.geom2):
-                mujoco_body_id = self.root_model.geom_bodyid[geom_id]
-                holosoma_body_idx = self.mujoco_to_holosoma_body_map.get(mujoco_body_id)
-                if holosoma_body_idx is None:
+        for side in ("right", "left"):
+            metadata = self._get_foot_force_sensor_metadata(side)
+            force_adr = metadata["force_adr"]
+            torque_adr = metadata["torque_adr"]
+
+            for env_idx in range(self.num_envs):
+                sensordata = sensordata_by_env[env_idx]
+                force_site = sensordata[force_adr : force_adr + 3].to(device=self.sim_device, dtype=torch.float32)
+                torque_site = sensordata[torque_adr : torque_adr + 3].to(device=self.sim_device, dtype=torch.float32)
+
+                fz = float(force_site[2].item())
+                if abs(fz) <= normal_force_threshold:
                     continue
-                for side, foot_body_idx in self._foot_body_indices.items():
-                    if holosoma_body_idx == foot_body_idx:
-                        foot_world_points[side].append(
-                            torch.tensor(contact.pos.copy(), device=self.sim_device, dtype=torch.float32)
-                        )
-                        break
 
-        for side, world_points in foot_world_points.items():
-            if not world_points:
-                continue
+                # Resolve CoP in the local foot sensor frame from the local torque about x/y.
+                plane_z = float(foot_center[2].item())
+                cop_x = -float(torque_site[1].item()) / fz
+                cop_y = float(torque_site[0].item()) / fz
 
-            foot_body_idx = self._foot_body_indices[side]
-            mujoco_foot_body_id = self.holosoma_to_mujoco_body_map.get(foot_body_idx)
-            if mujoco_foot_body_id is None:
-                logger.warning(f"Missing MuJoCo body id for holosoma foot body idx {foot_body_idx} ({side})")
-                continue
-            points_w = torch.stack(world_points, dim=0)
-            foot_quat_w = self._rigid_body_rot[0, mujoco_foot_body_id]
-            foot_quat_inv = quat_inverse(foot_quat_w, w_last=True).unsqueeze(0).repeat(points_w.shape[0], 1)
-            foot_pos_w = self._rigid_body_pos[0, mujoco_foot_body_id]
-            local_contact_points = quat_apply(
-                foot_quat_inv,
-                points_w - foot_pos_w.unsqueeze(0),
-                w_last=True,
-            )
-            barycenter, support_axes = self._summarize_local_foot_contacts(local_contact_points)
+                min_x = float(foot_center[0].item()) - half_length
+                max_x = float(foot_center[0].item()) + half_length
+                min_y = float(foot_center[1].item()) - half_width
+                max_y = float(foot_center[1].item()) + half_width
 
-            if side == "right":
-                self.right_foot_contact_position[0, :] = barycenter
-                self.right_foot_contact_basis[0, :] = support_axes
-                self.right_foot_contact_count[0] = points_w.shape[0]
-            else:
-                self.left_foot_contact_position[0, :] = barycenter
-                self.left_foot_contact_basis[0, :] = support_axes
-                self.left_foot_contact_count[0] = points_w.shape[0]
+                inside_x = min_x <= cop_x <= max_x
+                inside_y = min_y <= cop_y <= max_y
+
+                if inside_x and inside_y:
+                    contact_position = foot_center.clone()
+                    support_axes = torch.ones(3, device=self.sim_device, dtype=torch.float32)
+                else:
+                    clamped_x = min(max(cop_x, min_x), max_x)
+                    clamped_y = min(max(cop_y, min_y), max_y)
+                    contact_position = torch.tensor(
+                        [clamped_x, clamped_y, plane_z], device=self.sim_device, dtype=torch.float32
+                    )
+
+                    support_axes = torch.zeros(3, device=self.sim_device, dtype=torch.float32)
+                    rel_x = clamped_x - float(foot_center[0].item())
+                    rel_y = clamped_y - float(foot_center[1].item())
+
+                    interior_x = abs(rel_x) < (half_length - eps)
+                    interior_y = abs(rel_y) < (half_width - eps)
+                    on_x_face = abs(rel_x) <= (half_length + eps)
+                    on_y_face = abs(rel_y) <= (half_width + eps)
+
+                    if interior_x and interior_y:
+                        support_axes[:] = 1.0
+                    elif not interior_x and on_x_face and interior_y:
+                        support_axes[0] = 1.0
+                        support_axes[2] = 1.0
+                    elif interior_x and not interior_y and on_y_face:
+                        support_axes[1] = 1.0
+                        support_axes[2] = 1.0
+
+                if side == "right":
+                    self.right_foot_contact_position[env_idx, :] = contact_position
+                    self.right_foot_contact_basis[env_idx, :] = support_axes
+                    self.right_foot_contact_count[env_idx] = 1
+                else:
+                    self.left_foot_contact_position[env_idx, :] = contact_position
+                    self.left_foot_contact_basis[env_idx, :] = support_axes
+                    self.left_foot_contact_count[env_idx] = 1
 
     def apply_torques_at_dof(self, torques: torch.Tensor) -> None:
         """Apply torques with backend-specific optimization.
@@ -1325,8 +1361,10 @@ class MuJoCo(BaseSimulator):
             Which environments to update (None = all).
         dof_states : Optional[torch.Tensor]
             DOF states to set. Format depends on tensor shape:
-            - 2D [num_selected_envs, num_dofs, 2]: IsaacSim format [pos, vel] per DOF
+            - 3D [num_selected_envs, num_dofs, 2]: pre-sliced format [pos, vel] per DOF
+            - 3D [num_envs, num_dofs, 2]: full global tensor (will be sliced automatically)
             - 2D [num_selected_envs * num_dofs, 2]: IsaacGym flattened format
+            - 2D [num_envs * num_dofs, 2]: full global flattened tensor (will be sliced automatically)
             If None, uses current dof_state.
         """
         if env_ids is None:
@@ -1346,14 +1384,30 @@ class MuJoCo(BaseSimulator):
 
         if dof_states is None:
             raise ValueError("dof_states must be provided or available on the simulator.")
+
+        if getattr(dof_states, "_is_tensor_proxy", False):
+            dof_states = dof_states[:]
+
         if dof_states.dim() == 3:
-            if dof_states.shape != (len(env_ids), self.num_dof, 2):
+            if dof_states.shape == (self.num_envs, self.num_dof, 2):
+                dof_states = dof_states[env_ids]
+            elif dof_states.shape != (len(env_ids), self.num_dof, 2):
                 raise ValueError(
                     f"Unsupported dof_states tensor format: {dof_states.shape}. "
                     f"Expected [num_envs, num_dofs, 2] or [num_envs * num_dofs, 2]"
                 )
             dof_states = dof_states.reshape(len(env_ids) * self.num_dof, 2)
-        elif dof_states.dim() != 2 or dof_states.shape != (len(env_ids) * self.num_dof, 2):
+        elif dof_states.dim() == 2:
+            if dof_states.shape == (self.num_envs * self.num_dof, 2):
+                dof_states = dof_states.reshape(self.num_envs, self.num_dof, 2)[env_ids].reshape(
+                    len(env_ids) * self.num_dof, 2
+                )
+            elif dof_states.shape != (len(env_ids) * self.num_dof, 2):
+                raise ValueError(
+                    f"Unsupported dof_states tensor format: {dof_states.shape}. "
+                    f"Expected [num_envs, num_dofs, 2] or [num_envs * num_dofs, 2]"
+                )
+        else:
             raise ValueError(
                 f"Unsupported dof_states tensor format: {dof_states.shape}. "
                 f"Expected [num_envs, num_dofs, 2] or [num_envs * num_dofs, 2]"
@@ -1537,18 +1591,32 @@ class MuJoCo(BaseSimulator):
 
     def get_foot_force_sensor_wrench(self, side: str, env_id: int = 0) -> torch.Tensor:
         """Return foot force-torque sensor data expressed in the world frame."""
-        if env_id != 0:
-            raise RuntimeError(f"MuJoCo classic currently only supports single environment (env_id=0), got {env_id}")
-
-        if self.simulator_config.mujoco_backend != MujocoBackend.CLASSIC:
-            raise RuntimeError("World-frame foot force sensor wrench is currently implemented for MuJoCo ClassicBackend.")
-
-        assert self.root_data is not None
-
         metadata = self._get_foot_force_sensor_metadata(side)
         force_adr = metadata["force_adr"]
         torque_adr = metadata["torque_adr"]
         site_id = metadata["site_id"]
+
+        if self.simulator_config.mujoco_backend == MujocoBackend.WARP:
+            if env_id < 0 or env_id >= self.num_envs:
+                raise RuntimeError(f"Invalid MuJoCo Warp env_id={env_id}; expected [0, {self.num_envs - 1}].")
+            if not hasattr(self.backend, "sensordata_t") or not hasattr(self.backend, "site_xmat_t"):
+                raise RuntimeError("MuJoCo WarpBackend does not expose force sensor tensors.")
+
+            sensordata = self.backend.sensordata_t[env_id]  # type: ignore[attr-defined]
+            force_site = sensordata[force_adr : force_adr + 3]
+            torque_site = sensordata[torque_adr : torque_adr + 3]
+
+            site_xmat = self.backend.site_xmat_t[env_id, site_id]  # type: ignore[attr-defined]
+            if site_xmat.ndim == 1:
+                site_xmat = site_xmat.reshape(3, 3)
+            force_world = site_xmat @ force_site
+            torque_world = site_xmat @ torque_site
+            return torch.cat([force_world, torque_world], dim=0).to(device=self.sim_device, dtype=torch.float32)
+
+        if env_id != 0:
+            raise RuntimeError(f"MuJoCo classic currently only supports single environment (env_id=0), got {env_id}")
+
+        assert self.root_data is not None
 
         force_site = self.root_data.sensordata[force_adr : force_adr + 3]
         torque_site = self.root_data.sensordata[torque_adr : torque_adr + 3]
