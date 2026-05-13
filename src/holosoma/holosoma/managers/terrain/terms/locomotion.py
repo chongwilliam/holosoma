@@ -113,6 +113,11 @@ class TerrainLocomotion(TerrainTermBase):
         """Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
         Otherwise create a grid.
         """
+        if self._cfg.spawn.zero_origin:
+            self._custom_origins = False
+            self._env_origins.zero_()
+            return
+
         self._custom_origins = True
 
         if self._cfg.spawn.randomize_tiles:

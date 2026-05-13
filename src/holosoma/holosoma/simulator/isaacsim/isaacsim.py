@@ -897,6 +897,9 @@ class IsaacSim(BaseSimulator):
         ]  # (num_envs, 4) 3 isaacsim use wxyz, we keep xyzw for consistency
         self._rigid_body_vel = self._robot.data.body_lin_vel_w[:, self.body_ids, :]
         self._rigid_body_ang_vel = self._robot.data.body_ang_vel_w[:, self.body_ids, :]
+        self.com_pos = self._rigid_body_pos.mean(dim=1)
+        self.com_lin_vel = self._rigid_body_vel.mean(dim=1)
+        self.com_vel = self.com_lin_vel
 
     def clear_contact_forces_history(self, env_id):
         if len(env_id) > 0:

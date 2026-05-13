@@ -2,6 +2,7 @@
 
 from holosoma.config_types.observation import ObservationManagerCfg, ObsGroupCfg, ObsTermCfg
 
+# Task observations are relative to the yaw-aligned pelvis: z is up, while x/y are aligned with the pelvis.
 g1_29dof_loco_single_wolinvel = ObservationManagerCfg(
     groups={
         "actor_obs": ObsGroupCfg(
@@ -44,6 +45,81 @@ g1_29dof_loco_single_wolinvel = ObservationManagerCfg(
                     scale=1.0,
                     noise=0.0,
                 ),
+                # "com_pos": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:com_pos",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "com_lin_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:com_lin_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "pelvis_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:pelvis_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "pelvis_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:pelvis_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "torso_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:torso_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "torso_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:torso_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_pos": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_pos",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_lin_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_lin_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_pos": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_pos",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_lin_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_lin_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "contact_state": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:contact_state",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
                 "sin_phase": ObsTermCfg(
                     func="holosoma.managers.observation.terms.locomotion:sin_phase",
                     scale=1.0,
@@ -101,6 +177,76 @@ g1_29dof_loco_single_wolinvel = ObservationManagerCfg(
                     scale=1.0,
                     noise=0.0,
                 ),
+                # "com_pos": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:com_pos",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "com_lin_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:com_lin_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "pelvis_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:pelvis_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "pelvis_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:pelvis_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "torso_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:torso_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "torso_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:torso_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_pos": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_pos",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_lin_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_lin_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "right_foot_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:right_foot_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_pos": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_pos",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_lin_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_lin_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_ori": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_ori",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
+                # "left_foot_ang_vel": ObsTermCfg(
+                #     func="holosoma.managers.observation.terms.locomotion:left_foot_ang_vel",
+                #     scale=1.0,
+                #     noise=0.0,
+                # ),
                 "sin_phase": ObsTermCfg(
                     func="holosoma.managers.observation.terms.locomotion:sin_phase",
                     scale=1.0,

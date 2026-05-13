@@ -123,6 +123,8 @@ class WholeBodyTrackingPolicy(BasePolicy):
         self.onnx_policy_session = onnxruntime.InferenceSession(model_path)
         self.onnx_input_names = [inp.name for inp in self.onnx_policy_session.get_inputs()]
         self.onnx_output_names = [out.name for out in self.onnx_policy_session.get_outputs()]
+        action_output = next((out for out in self.onnx_policy_session.get_outputs() if out.name == "actions"), None)
+        self.onnx_action_dim = self._onnx_dim(action_output.shape[-1]) if action_output is not None else None
 
         # Extract KP/KD from ONNX metadata (same as base class)
         onnx_model = onnx.load(model_path)

@@ -103,4 +103,20 @@ g1_29dof_randomization = RandomizationManagerCfg(
     },
 )
 
-__all__ = ["g1_29dof_randomization"]
+g1_29dof_randomization_dual_stance_reset = RandomizationManagerCfg(
+    setup_terms=g1_29dof_randomization.setup_terms,
+    reset_terms={
+        **g1_29dof_randomization.reset_terms,
+        "reset_robot_to_dual_stance": RandomizationTermCfg(
+            func="holosoma.managers.randomization.terms.locomotion:reset_robot_to_init_state",
+            params={
+                "enabled": True,
+                "reset_root": True,
+                "reset_dofs": True,
+            },
+        ),
+    },
+    step_terms=g1_29dof_randomization.step_terms,
+)
+
+__all__ = ["g1_29dof_randomization", "g1_29dof_randomization_dual_stance_reset"]

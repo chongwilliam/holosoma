@@ -278,6 +278,36 @@ class IMujocoBackend(abc.ABC):
         """
         return None  # Default implementation - backends can override
 
+    def get_subtree_com_pos_view(self, body_id: int) -> torch.Tensor | None:
+        """Get subtree center-of-mass positions for a MuJoCo body, if supported.
+
+        Parameters
+        ----------
+        body_id : int
+            MuJoCo body id whose subtree COM should be returned.
+
+        Returns
+        -------
+        torch.Tensor | None
+            Tensor with shape [num_envs, 3], or None if unsupported.
+        """
+        return None  # Default implementation - backends can override
+
+    def get_subtree_com_lin_vel_view(self, body_id: int) -> torch.Tensor | None:
+        """Get subtree center-of-mass linear velocities for a MuJoCo body, if supported.
+
+        Parameters
+        ----------
+        body_id : int
+            MuJoCo body id whose subtree COM linear velocity should be returned.
+
+        Returns
+        -------
+        torch.Tensor | None
+            Tensor with shape [num_envs, 3], or None if unsupported.
+        """
+        return None  # Default implementation - backends can override
+
     @abc.abstractmethod
     def create_quaternion_view(self, quat_slice: slice):
         """Create quaternion view with format conversion.

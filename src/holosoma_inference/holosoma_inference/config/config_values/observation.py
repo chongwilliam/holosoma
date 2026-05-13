@@ -36,7 +36,8 @@ loco_g1_29dof = ObservationConfig(
         "command_ang_vel": 1,
         "dof_pos": 29,
         "dof_vel": 29,
-        "actions": 29,
+        # "actions": 29, # default
+        "actions": 12,
         "sin_phase": 2,
         "cos_phase": 2,
     },

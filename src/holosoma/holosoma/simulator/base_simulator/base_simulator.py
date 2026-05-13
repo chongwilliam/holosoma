@@ -110,6 +110,8 @@ class BaseSimulator:
     viewer: object
     robot_root_states: torch.Tensor
     base_quat: torch.Tensor
+    com_pos: torch.Tensor
+    com_lin_vel: torch.Tensor
     dof_pos: torch.Tensor
     dof_vel: torch.Tensor
     right_foot_contact_basis: torch.Tensor  # (num_envs, 3): [roll, pitch, yaw] support
@@ -197,6 +199,17 @@ class BaseSimulator:
         self.left_foot_contact_position = torch.zeros_like(self.right_foot_contact_position)
         self.right_foot_contact_count = torch.zeros(self.num_envs, device=self.sim_device, dtype=torch.long)
         self.left_foot_contact_count = torch.zeros_like(self.right_foot_contact_count)
+        self._foot_contact_filter_initialized = torch.zeros(
+            self.num_envs, 2, device=self.sim_device, dtype=torch.bool
+        )
+        self._foot_contact_filtered_position = torch.zeros(
+            self.num_envs, 2, 3, device=self.sim_device, dtype=torch.float32
+        )
+        self._foot_contact_filtered_basis = torch.zeros_like(self._foot_contact_filtered_position)
+        self._foot_contact_candidate_basis = torch.zeros_like(self._foot_contact_filtered_position)
+        self._foot_contact_candidate_basis_steps = torch.zeros(
+            self.num_envs, 2, device=self.sim_device, dtype=torch.long
+        )
 
     def _clear_foot_contact_buffers(self) -> None:
         """Reset shared foot-contact summary buffers to the no-contact state."""
@@ -206,6 +219,12 @@ class BaseSimulator:
         self.left_foot_contact_position.zero_()
         self.right_foot_contact_count.zero_()
         self.left_foot_contact_count.zero_()
+
+    def get_local_foot_force_sensor_wrench(self, side: str, env_id: int = 0) -> torch.Tensor:
+        """Return foot force-torque sensor data expressed in the sensor-local frame."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_local_foot_force_sensor_wrench()."
+        )
 
     def _find_foot_body_indices(self) -> dict[str, int]:
         """Resolve left/right foot body indices from configured body names."""

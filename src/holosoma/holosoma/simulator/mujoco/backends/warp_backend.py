@@ -7,7 +7,7 @@ Key features:
 - GPU-accelerated simulation via Warp kernels
 - Batched parallel environments (1 to thousands)
 - Zero-copy PyTorch tensor access via wp.to_torch()
-- Automatic contact force computation (cfrc_ext)
+- Explicit force/torque sensor tensor access for contact-force views
 - Efficient GPU->CPU sync for rendering only when needed
 
 Optional Dependencies
@@ -56,7 +56,7 @@ class WarpBackend(IMujocoBackend):
     Key characteristics:
     - Multi-environment support (1 to thousands)
     - GPU-based computation via Warp kernels
-    - Automatic contact force computation (cfrc_ext tensor)
+    - Explicit force/torque sensor tensor access for contact-force views
     - Zero-copy PyTorch tensor access
     - Efficient GPU->CPU sync only for rendering
 
@@ -92,6 +92,7 @@ class WarpBackend(IMujocoBackend):
         # Import warp packages (fail fast if not available)
         try:
             import mujoco_warp as mjw
+            from mujoco_warp._src import smooth as mjw_smooth
             import warp as wp
         except ImportError as e:
             raise ImportError(
@@ -102,6 +103,7 @@ class WarpBackend(IMujocoBackend):
         # Initialize Warp runtime
         wp.init()
         self.mjw_device = wp.get_device(device)
+        self._mjw_smooth = mjw_smooth
 
         logger.info(f"Initializing WarpBackend: {self.num_envs} envs on {device}")
 
@@ -150,12 +152,19 @@ class WarpBackend(IMujocoBackend):
             self.xpos_t = wp.to_torch(self.mjw_data.xpos)  # [num_envs, nbody, 3] - positions
             self.xquat_t = wp.to_torch(self.mjw_data.xquat)  # [num_envs, nbody, 4] - orientations [w,x,y,z]
             self.cvel_t = wp.to_torch(self.mjw_data.cvel)  # [num_envs, nbody, 6] - velocities [ang(3), lin(3)]
+            self.subtree_com_t = wp.to_torch(self.mjw_data.subtree_com)  # [num_envs, nbody, 3]
+            self.subtree_linvel_t = wp.to_torch(self.mjw_data.subtree_linvel)  # [num_envs, nbody, 3]
             self.site_xmat_t = wp.to_torch(self.mjw_data.site_xmat)  # [num_envs, nsite, 3, 3] or [..., 9]
 
         # Keep reference to CPU data for rendering (synced on demand)
         self.render_data = data
         self._mujoco_to_holosoma_body_map: dict[int, int] = {}
         self._force_tensor = torch.zeros(self.num_envs, model.nbody, 6, device=device)
+        self._force_sensor_wrench_sources = self._resolve_force_sensor_wrench_sources(model)
+        if not self._force_sensor_wrench_sources:
+            logger.warning(
+                "WarpBackend found no explicit MuJoCo force sensors; contact_forces will remain zero."
+            )
 
         self._use_cuda_graph = bool(getattr(self.mjw_device, "is_cuda", False))
         self.step_graph = None
@@ -180,10 +189,36 @@ class WarpBackend(IMujocoBackend):
         """Store MuJoCo-to-holosoma body index mapping for contact remapping."""
         self._mujoco_to_holosoma_body_map = dict(mujoco_to_holosoma_body_map)
 
+    def _resolve_force_sensor_wrench_sources(self, model: mujoco.MjModel) -> list[tuple[int, int, int | None]]:
+        """Pair explicit MuJoCo force/torque site sensors by body.
+
+        Each tuple is ``(mujoco_body_id, force_adr, torque_adr_or_none)``. The
+        force sensor is required; the matching torque sensor is used when present.
+        """
+        force_by_site: dict[int, int] = {}
+        torque_by_site: dict[int, int] = {}
+
+        for sensor_id in range(model.nsensor):
+            sensor_type = int(model.sensor_type[sensor_id])
+            site_id = int(model.sensor_objid[sensor_id])
+            sensor_adr = int(model.sensor_adr[sensor_id])
+            if site_id < 0:
+                continue
+            if sensor_type == int(mujoco.mjtSensor.mjSENS_FORCE):
+                force_by_site[site_id] = sensor_adr
+            elif sensor_type == int(mujoco.mjtSensor.mjSENS_TORQUE):
+                torque_by_site[site_id] = sensor_adr
+
+        sources: list[tuple[int, int, int | None]] = []
+        for site_id, force_adr in force_by_site.items():
+            mujoco_body_id = int(model.site_bodyid[site_id])
+            sources.append((mujoco_body_id, force_adr, torque_by_site.get(site_id)))
+        return sources
+
     def initialize_state(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """Initialize GPU state from CPU data after construction.
 
-        This syncs the initial state set by _set_robot_initial_state()
+        This syncs the initial state set by _set_robot_initial_state() 
         and _set_initial_joint_angles() to GPU tensors, overriding the
         default qpos0 values from the MJCF model.
 
@@ -286,11 +321,7 @@ class WarpBackend(IMujocoBackend):
         return self.ctrl_t
 
     def refresh_sim_tensors(self, contact_history_tensor: torch.Tensor) -> None:
-        """Update contact force history.
-
-        Unlike ClassicBackend, WarpBackend automatically computes contact
-        forces in the cfrc_ext tensor during simulation. We just need to
-        update the rolling history buffer.
+        """Update contact force history from explicit MuJoCo force sensors.
 
         Parameters
         ----------
@@ -298,10 +329,15 @@ class WarpBackend(IMujocoBackend):
             Contact wrench history buffer [num_envs, history_len, num_bodies, 6]
         """
         self._force_tensor.zero_()
-        for mujoco_body_id, holosoma_body_idx in self._mujoco_to_holosoma_body_map.items():
-            cfrc = self.cfrc_t[:, mujoco_body_id]
-            self._force_tensor[:, holosoma_body_idx, :3] = cfrc[:, 3:6]
-            self._force_tensor[:, holosoma_body_idx, 3:6] = cfrc[:, :3]
+        for mujoco_body_id, force_adr, torque_adr in self._force_sensor_wrench_sources:
+            holosoma_body_idx = self._mujoco_to_holosoma_body_map.get(mujoco_body_id)
+            if holosoma_body_idx is None:
+                continue
+            self._force_tensor[:, holosoma_body_idx, :3] = - self.sensordata_t[:, force_adr : force_adr + 3]
+            if torque_adr is not None:
+                self._force_tensor[:, holosoma_body_idx, 3:6] = - self.sensordata_t[:, torque_adr : torque_adr + 3]
+
+        # print(self._force_tensor)  # verified to have sign flip
 
         # Update history: shift old values right, add current at position 0
         contact_history_tensor[:] = torch.cat([self._force_tensor.unsqueeze(1), contact_history_tensor[:, :-1]], dim=1)
@@ -520,6 +556,25 @@ class WarpBackend(IMujocoBackend):
         linear_vel = self.cvel_t[..., 3:6]  # [N, nbody, 3]
 
         return positions, orientations, linear_vel, angular_vel
+
+    def get_subtree_com_pos_view(self, body_id: int) -> torch.Tensor:
+        """Compute and return subtree COM positions for the requested MuJoCo body."""
+        import warp as wp
+
+        with wp.ScopedDevice(self.mjw_device):
+            self._mjw_smooth.com_pos(self.mjw_model, self.mjw_data)
+
+        return self.subtree_com_t[:, body_id]
+
+    def get_subtree_com_lin_vel_view(self, body_id: int) -> torch.Tensor:
+        """Compute and return subtree COM linear velocities for the requested MuJoCo body."""
+        import warp as wp
+
+        with wp.ScopedDevice(self.mjw_device):
+            self._mjw_smooth.com_pos(self.mjw_model, self.mjw_data)
+            self._mjw_smooth.subtree_vel(self.mjw_model, self.mjw_data)
+
+        return self.subtree_linvel_t[:, body_id]
 
     def set_root_state(self, env_ids: torch.Tensor, root_states: torch.Tensor, root_addrs: dict) -> None:
         """Set robot root states via direct GPU tensor writes.

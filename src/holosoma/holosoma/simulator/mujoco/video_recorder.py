@@ -115,9 +115,8 @@ class MuJoCoVideoRecorder(VideoRecorderInterface):
         RuntimeError
             If frame capture fails due to rendering issues.
         """
-        # Get render data via backend (handles GPU→CPU sync for WarpBackend)
-        # Always use world_id=0 to record from first environment
-        render_data = self.simulator.backend.get_render_data(world_id=0)
+        # Get render data via backend (handles GPU→CPU sync for WarpBackend).
+        render_data = self.simulator.backend.get_render_data(world_id=self.record_env_id)
 
         # Update camera position (properties create renderer/camera if needed)
         self._update_camera_position(self.camera)

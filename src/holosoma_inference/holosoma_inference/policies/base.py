@@ -142,7 +142,7 @@ class BasePolicy:
 
     def _init_policy_components(self, model_path, policy_action_scale, rl_rate):
         """Initialize policy-related components."""
-        self.policy_action_scale = policy_action_scale
+        self.policy_action_scale = np.asarray(policy_action_scale, dtype=np.float32)
         self.rl_rate = rl_rate
         self.model_paths = self._collect_model_paths(model_path)
         self._policy_states: list[dict] = []
@@ -154,6 +154,8 @@ class BasePolicy:
             local_path = self._resolve_model_path(str(path))
             resolved_paths.append(local_path)
             self.setup_policy(local_path)
+            self._align_action_observation_dim(local_path)
+            self._reset_policy_action_buffers()
             self._policy_states.append(self._capture_policy_state())
 
         self.model_paths = resolved_paths
@@ -201,6 +203,7 @@ class BasePolicy:
             "policy_callable": self.policy,
             "onnx_kp": self.onnx_kp,
             "onnx_kd": self.onnx_kd,
+            "onnx_action_dim": self.onnx_action_dim,
         }
 
     def _restore_policy_state(self, state: dict):
@@ -211,6 +214,7 @@ class BasePolicy:
         self.policy = state["policy_callable"]
         self.onnx_kp = state["onnx_kp"]
         self.onnx_kd = state["onnx_kd"]
+        self.onnx_action_dim = state["onnx_action_dim"]
 
     def _activate_policy(self, index: int, announce: bool = True):
         """Activate a preloaded policy."""
@@ -222,6 +226,7 @@ class BasePolicy:
         self.scaled_policy_action.fill(0.0)
         self.active_policy_index = index
         self.active_model_path = self.model_paths[index]
+        self._reset_policy_action_buffers()
         self._on_policy_switched(self.active_model_path)
 
         if announce and len(self.model_paths) > 1 and hasattr(self, "logger"):
@@ -269,6 +274,7 @@ class BasePolicy:
 
         # Upper body controller
         self.upper_body_controller = None
+        self.task_space_wbc = None
 
         # Pre-allocate command arrays for postprocessing
         self.cmd_q = np.zeros(self.num_dofs)
@@ -354,6 +360,7 @@ class BasePolicy:
 
         self.onnx_input_names = input_names
         self.onnx_output_names = output_names
+        self.onnx_action_dim = self._onnx_dim(self.onnx_policy_session.get_outputs()[0].shape[-1])
 
         # Extract metadata from ONNX model (hard fault if fails)
         onnx_model = onnx.load(model_path)
@@ -380,6 +387,61 @@ class BasePolicy:
             return outputs[0]  # just return outputs[0] as only "action" is needed
 
         self.policy = policy_act
+
+    def _align_action_observation_dim(self, model_path: str) -> None:
+        actor_input = next((inp for inp in self.onnx_policy_session.get_inputs() if inp.name == "actor_obs"), None)
+        if actor_input is None:
+            return
+
+        expected_actor_obs_dim = self._onnx_dim(actor_input.shape[-1])
+        if expected_actor_obs_dim is None:
+            return
+
+        current_actor_obs_dim = self.obs_dim_dict.get("actor_obs")
+        if current_actor_obs_dim == expected_actor_obs_dim:
+            return
+
+        actor_terms = self.obs_dict.get("actor_obs", [])
+        if "actions" not in actor_terms:
+            raise ValueError(
+                f"ONNX actor_obs dim mismatch for {model_path}: expected {expected_actor_obs_dim}, "
+                f"configured {current_actor_obs_dim}, and actor_obs has no actions term to resize."
+            )
+
+        adjusted_action_dim = self.obs_dims["actions"] + expected_actor_obs_dim - current_actor_obs_dim
+        if adjusted_action_dim <= 0:
+            raise ValueError(
+                f"ONNX actor_obs dim mismatch for {model_path}: expected {expected_actor_obs_dim}, "
+                f"configured {current_actor_obs_dim}; computed invalid actions dim {adjusted_action_dim}."
+            )
+
+        logger.warning(
+            "Adjusting inference observation actions dim from {} to {} to match ONNX actor_obs dim {}.",
+            self.obs_dims["actions"],
+            adjusted_action_dim,
+            expected_actor_obs_dim,
+        )
+        self.obs_dims["actions"] = adjusted_action_dim
+        self.obs_dim_dict = self._calculate_obs_dim_dict()
+        self._initialize_history_state()
+
+    def _reset_policy_action_buffers(self) -> None:
+        action_dim = self.onnx_action_dim or self.obs_dims.get("actions", self.num_dofs)
+        self.last_policy_action = np.zeros((1, action_dim), dtype=np.float32)
+        self.scaled_policy_action = np.zeros((1, action_dim), dtype=np.float32)
+        self._validate_policy_action_scale(action_dim)
+
+    def _onnx_dim(self, dim) -> int | None:
+        return int(dim) if isinstance(dim, int) and dim > 0 else None
+
+    def _validate_policy_action_scale(self, action_dim: int) -> None:
+        if self.policy_action_scale.ndim == 0:
+            return
+        if self.policy_action_scale.shape != (action_dim,):
+            raise ValueError(
+                "task.policy_action_scale must be scalar or match the ONNX action dimension. "
+                f"Got shape {self.policy_action_scale.shape} for action_dim={action_dim}."
+            )
 
     def _resolve_control_gains(self):
         """Resolve KP/KD values with priority: config override > ONNX metadata > error.
@@ -463,9 +525,49 @@ class BasePolicy:
         policy_action = np.clip(policy_action, -100, 100)
 
         self.last_policy_action = policy_action.copy()
-        self.scaled_policy_action = policy_action * self.policy_action_scale
+        # self.scaled_policy_action = policy_action * self.policy_action_scale
+        self.scaled_policy_action = policy_action
 
         return self.scaled_policy_action
+
+    def _policy_action_to_command(
+        self,
+        scaled_policy_action: np.ndarray,
+        robot_state_data: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        action_space = self.config.task.policy_action_space
+        if action_space == "joint_position":
+            if scaled_policy_action.shape[1] != self.num_dofs:
+                raise ValueError(
+                    "Joint-position inference requires policy action dim to match robot DOFs. "
+                    f"Got action_dim={scaled_policy_action.shape[1]}, num_dofs={self.num_dofs}. "
+                    "Set task.policy_action_space appropriately if this policy is not a joint-position policy."
+                )
+            q_target = scaled_policy_action + self.default_dof_angles
+            return q_target.reshape(-1), np.zeros(self.num_dofs), None, None
+
+        if action_space == "task_space":
+            torques = self._compute_task_space_torques(scaled_policy_action)
+            q_target = robot_state_data[0, 7 : 7 + self.num_dofs]
+            zero_gains = np.zeros(self.num_dofs, dtype=np.float32)
+            return q_target, torques, zero_gains, zero_gains
+
+        raise ValueError(f"Unsupported task.policy_action_space: {action_space!r}")
+
+    def _compute_task_space_torques(self, scaled_policy_action: np.ndarray) -> np.ndarray:
+        if self.task_space_wbc is None:
+            from holosoma_inference.policies.task_space_wbc import TaskSpaceWbcTorqueComputer
+
+            self.task_space_wbc = TaskSpaceWbcTorqueComputer(self.config.task, self.num_dofs)
+        phase = self.phase if getattr(self, "use_phase", False) and hasattr(self, "phase") else None
+        lin_vel_command = getattr(self, "lin_vel_command", None)
+        ang_vel_command = getattr(self, "ang_vel_command", None)
+        return self.task_space_wbc.compute(
+            scaled_policy_action,
+            phase=phase,
+            lin_vel_command=lin_vel_command,
+            ang_vel_command=ang_vel_command,
+        )
 
     # ============================================================================
     # Observation Processing Methods
@@ -608,15 +710,13 @@ class BasePolicy:
 
         # Stage 4: Post-processing
         with self.latency_tracker.measure("postprocessing"):
+            self.cmd_tau.fill(0.0)
+            self.cmd_dq.fill(0.0)
             if self.use_policy_action and not self.get_ready_state:
-                if scaled_policy_action.shape[1] != self.num_dofs:
-                    if not self.upper_body_controller:
-                        scaled_policy_action = np.concatenate(
-                            [np.zeros((1, self.num_dofs - scaled_policy_action.shape[1])), scaled_policy_action], axis=1
-                        )
-                    else:
-                        raise NotImplementedError("Upper body controller not implemented")
-                q_target = scaled_policy_action + self.default_dof_angles
+                q_target, tau_target, kp_override, kd_override = self._policy_action_to_command(
+                    scaled_policy_action, robot_state_data
+                )
+                self.cmd_tau[:] = tau_target
 
             # Prepare command (reuse pre-allocated arrays)
             self.cmd_q[:] = q_target

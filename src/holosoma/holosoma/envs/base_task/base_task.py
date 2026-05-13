@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from holosoma.config_types.env import EnvConfig
@@ -409,13 +411,212 @@ class BaseTask:
 
     def _physics_step(self):
         self.render()
-        for _ in range(self.simulator.simulator_config.sim.control_decimation):
+        for substep_idx in range(self.simulator.simulator_config.sim.control_decimation):
             self._apply_force_in_physics_step()
+            self._maybe_trace_sim_state("pre_sim", substep_idx)
+            pre_step_snapshot = self._capture_sim_state_snapshot()
             self.simulator.simulate_at_each_physics_step()
+            self._maybe_trace_sim_state("post_sim", substep_idx)
+            if not self._assert_finite_sim_state_after_substep(substep_idx, pre_step_snapshot):
+                break
 
     def _apply_force_in_physics_step(self):
         if self.action_manager is not None:
             self.action_manager.apply_actions()
+
+    def _assert_finite_sim_state_after_substep(self, substep_idx: int, pre_step_snapshot: dict[str, torch.Tensor]) -> bool:
+        for label, value in (
+            ("post_sim_root_states", self.simulator.robot_root_states),
+            ("post_sim_dof_pos", self.simulator.dof_pos),
+            ("post_sim_dof_vel", self.simulator.dof_vel),
+        ):
+            tensor = self._sim_value_to_tensor(value)
+            finite = torch.isfinite(tensor)
+            if bool(finite.all()):
+                continue
+
+            bad_idx = (~finite).nonzero(as_tuple=False)[0].detach().cpu().tolist()
+            bad_value = tensor[tuple(bad_idx)].detach().cpu().item()
+            finite_values = tensor[finite].detach()
+            if finite_values.numel() == 0:
+                summary = "no finite values"
+            else:
+                summary = (
+                    f"finite_min={finite_values.min().cpu().item():.6g}, "
+                    f"finite_max={finite_values.max().cpu().item():.6g}"
+                )
+            self._focus_visualization_on_env(bad_idx[0] if bad_idx else None)
+            if os.environ.get("HOLOSOMA_ASSERT_FINITE_SIM_STATE", "0") != "1":
+                return False
+            raise RuntimeError(
+                f"{label} became non-finite after physics substep {substep_idx} "
+                f"at index {bad_idx}: {bad_value}; shape={tuple(tensor.shape)}, "
+                f"{summary}{self._pre_step_state_debug_summary(pre_step_snapshot, bad_idx)}"
+                f"{self._action_torque_debug_summary(bad_idx)}"
+            )
+        return True
+
+    def _focus_visualization_on_env(self, env_idx: int | None) -> None:
+        if env_idx is None:
+            return
+
+        if hasattr(self.simulator, "current_world_id"):
+            self.simulator.current_world_id = int(env_idx)
+
+        video_recorder = getattr(self.simulator, "video_recorder", None)
+        set_record_env_id = getattr(video_recorder, "set_record_env_id", None)
+        if callable(set_record_env_id):
+            set_record_env_id(int(env_idx))
+
+    def _capture_sim_state_snapshot(self) -> dict[str, torch.Tensor]:
+        return {
+            "pre_sim_root_states": self._sim_value_to_tensor(self.simulator.robot_root_states).detach().clone(),
+            "pre_sim_dof_pos": self._sim_value_to_tensor(self.simulator.dof_pos).detach().clone(),
+            "pre_sim_dof_vel": self._sim_value_to_tensor(self.simulator.dof_vel).detach().clone(),
+        }
+
+    def _sim_value_to_tensor(self, value):
+        if isinstance(value, torch.Tensor):
+            return value
+        if getattr(value, "_is_tensor_proxy", False):
+            return value[:]
+        return torch.as_tensor(value, device=self.device)
+
+    def _maybe_trace_sim_state(self, phase: str, substep_idx: int) -> None:
+        if os.environ.get("HOLOSOMA_TRACE_SIM_STATE", "0") != "1":
+            return
+
+        env_idx = int(os.environ.get("HOLOSOMA_TRACE_ENV_ID", "0"))
+        if env_idx < 0 or env_idx >= self.num_envs:
+            return
+
+        trace_every = max(1, int(os.environ.get("HOLOSOMA_TRACE_EVERY", "1")))
+        trace_first = max(0, int(os.environ.get("HOLOSOMA_TRACE_FIRST", "20")))
+        trace_threshold = float(os.environ.get("HOLOSOMA_TRACE_THRESHOLD", "100.0"))
+        trace_step = int(getattr(self, "_sim_state_trace_step", 0))
+
+        root = self._sim_value_to_tensor(self.simulator.robot_root_states)[env_idx].detach()
+        dof_pos = self._sim_value_to_tensor(self.simulator.dof_pos)[env_idx].detach()
+        dof_vel = self._sim_value_to_tensor(self.simulator.dof_vel)[env_idx].detach()
+        max_abs = max(
+            float(root.abs().max().cpu().item()),
+            float(dof_pos.abs().max().cpu().item()),
+            float(dof_vel.abs().max().cpu().item()),
+        )
+        should_trace = trace_step < trace_first or trace_step % trace_every == 0 or max_abs >= trace_threshold
+        if not should_trace:
+            if phase == "post_sim" and substep_idx == self.simulator.simulator_config.sim.control_decimation - 1:
+                self._sim_state_trace_step = trace_step + 1
+            return
+
+        torque_summary = "torque=n/a"
+        if self.action_manager is not None:
+            pieces = []
+            for term_name, term in self.action_manager.iter_terms():
+                torques = getattr(term, "torques", None)
+                if not isinstance(torques, torch.Tensor) or torques.numel() == 0:
+                    continue
+                env_torques = torques[env_idx].detach()
+                limits = getattr(self, "torque_limits", None)
+                saturation = ""
+                if isinstance(limits, torch.Tensor) and limits.numel() == env_torques.numel():
+                    limit_row = limits.to(device=env_torques.device, dtype=env_torques.dtype)
+                    saturation_frac = (env_torques.abs() >= limit_row).float().mean().cpu().item()
+                    saturation = f", sat={saturation_frac:.3f}"
+                extra = ""
+                term_debug_summary = getattr(term, "debug_summary", None)
+                if callable(term_debug_summary):
+                    extra_summary = term_debug_summary(env_idx)
+                    if extra_summary:
+                        extra = f", {extra_summary}"
+                pieces.append(
+                    f"{term_name}: min={env_torques.min().cpu().item():.6g}, "
+                    f"max={env_torques.max().cpu().item():.6g}, "
+                    f"max_abs={env_torques.abs().max().cpu().item():.6g}{saturation}{extra}"
+                )
+            if pieces:
+                torque_summary = "; ".join(pieces)
+
+        print(
+            "SIM_TRACE "
+            f"step={trace_step} phase={phase} substep={substep_idx} env={env_idx} "
+            f"root_pos={root[:3].detach().cpu().tolist()} "
+            f"root_quat={root[3:7].detach().cpu().tolist()} "
+            f"root_max_abs={root.abs().max().cpu().item():.6g} "
+            f"dof_pos_max_abs={dof_pos.abs().max().cpu().item():.6g} "
+            f"dof_vel_max_abs={dof_vel.abs().max().cpu().item():.6g} "
+            f"{torque_summary}",
+            flush=True,
+        )
+
+        if phase == "post_sim" and substep_idx == self.simulator.simulator_config.sim.control_decimation - 1:
+            self._sim_state_trace_step = trace_step + 1
+
+    def _action_torque_debug_summary(self, bad_idx: list[int]) -> str:
+        if not bad_idx or self.action_manager is None:
+            return ""
+
+        env_idx = bad_idx[0]
+        summaries = []
+        for term_name, term in self.action_manager.iter_terms():
+            torques = getattr(term, "torques", None)
+            if not isinstance(torques, torch.Tensor) or torques.numel() == 0:
+                continue
+            if env_idx < 0 or env_idx >= torques.shape[0]:
+                continue
+
+            env_torques = torques[env_idx].detach()
+            finite = torch.isfinite(env_torques)
+            if not bool(finite.all()):
+                summaries.append(f"{term_name}: torques=non-finite")
+                continue
+
+            max_abs = env_torques.abs().max().cpu().item()
+            summary = (
+                f"{term_name}: min={env_torques.min().cpu().item():.6g}, "
+                f"max={env_torques.max().cpu().item():.6g}, max_abs={max_abs:.6g}"
+            )
+            torque_limits = getattr(self, "torque_limits", None)
+            if isinstance(torque_limits, torch.Tensor) and torque_limits.numel() == env_torques.numel():
+                limits = torque_limits.to(device=env_torques.device, dtype=env_torques.dtype)
+                saturation_frac = (env_torques.abs() >= limits).float().mean().cpu().item()
+                summary += f", saturation_frac={saturation_frac:.3f}"
+            term_debug_summary = getattr(term, "debug_summary", None)
+            if callable(term_debug_summary):
+                extra_summary = term_debug_summary(env_idx)
+                if extra_summary:
+                    summary += f", {extra_summary}"
+            summaries.append(summary)
+
+        if not summaries:
+            return ""
+        return "; action_context=[" + "; ".join(summaries) + "]"
+
+    def _pre_step_state_debug_summary(self, snapshot: dict[str, torch.Tensor], bad_idx: list[int]) -> str:
+        if not bad_idx:
+            return ""
+
+        env_idx = bad_idx[0]
+        parts = []
+        for label, tensor in snapshot.items():
+            if env_idx < 0 or env_idx >= tensor.shape[0]:
+                continue
+            row = tensor[env_idx].detach().flatten()
+            finite = torch.isfinite(row)
+            if not bool(finite.any()):
+                parts.append(f"{label}: no finite values")
+                continue
+            finite_values = row[finite]
+            parts.append(
+                f"{label}: finite={bool(finite.all())}, "
+                f"min={finite_values.min().cpu().item():.6g}, "
+                f"max={finite_values.max().cpu().item():.6g}, "
+                f"max_abs={finite_values.abs().max().cpu().item():.6g}"
+            )
+
+        if not parts:
+            return ""
+        return "; pre_step_state=[" + "; ".join(parts) + "]"
 
     def _post_physics_step(self):
         self._refresh_sim_tensors()

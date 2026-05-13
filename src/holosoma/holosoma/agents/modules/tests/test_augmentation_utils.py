@@ -250,6 +250,81 @@ def test_augment_actions(mock_env_with_history):
     assert torch.allclose(augmented_actions[:batch_size], actions)
 
 
+def test_mirror_wbc_task_space_action(mock_env_with_history):
+    """Test mirroring for FastSAC WBC actions."""
+    symmetry_utils = SymmetryUtils(mock_env_with_history)
+
+    actions = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, -11.0, -12.0],
+        ]
+    )
+
+    mirrored = symmetry_utils.mirror_action_xz_plane(actions)
+    expected = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 10.0, -11.0, -12.0],
+            [-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0, -9.0, -10.0, 11.0, 12.0],
+        ]
+    )
+
+    assert torch.allclose(mirrored, expected)
+
+
+def test_mirror_wbc_task_space_action_observation(mock_env_with_history):
+    """Test mirroring for previous-action observations using the 12D WBC layout."""
+    symmetry_utils = SymmetryUtils(mock_env_with_history)
+
+    actions = torch.tensor([[0.5, -0.25, 1.25, 0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8, 0.9]])
+    mirrored = symmetry_utils.mirror_obs_actions(actions)
+    expected = torch.tensor([[0.5, 0.25, 1.25, -0.1, -0.2, -0.3, 0.4, 0.5, 0.6, 0.7, 0.8, -0.9]])
+
+    assert torch.allclose(mirrored, expected)
+
+
+def test_mirror_wbc_named_policy_terms(mock_env_with_history):
+    """Test mirroring helpers for named WBC policy terms."""
+    symmetry_utils = SymmetryUtils(mock_env_with_history)
+
+    com_vel = torch.tensor([[1.0, 2.0]])
+    torso_yaw_vel = torch.tensor([[3.0]])
+    landing_delta = torch.tensor([[4.0, 5.0, 6.0]])
+
+    assert torch.allclose(
+        symmetry_utils.mirror_obs_com_vel(com_vel),
+        torch.tensor([[1.0, -2.0]]),
+    )
+    assert torch.allclose(
+        symmetry_utils.mirror_obs_torso_yaw_vel(torso_yaw_vel),
+        torch.tensor([[-3.0]]),
+    )
+    assert torch.allclose(
+        symmetry_utils.mirror_obs_landing_foot_delta_pose(landing_delta),
+        torch.tensor([[4.0, -5.0, -6.0]]),
+    )
+
+
+def test_mirror_wbc_foot_velocity_terms(mock_env_with_history):
+    """Test combined and per-foot WBC spatial velocity mirroring."""
+    symmetry_utils = SymmetryUtils(mock_env_with_history)
+
+    right_vel = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]])
+    left_vel = torch.tensor([[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]])
+    foot_vel = torch.cat([right_vel, left_vel], dim=-1)
+
+    mirrored = symmetry_utils.mirror_obs_foot_vel(foot_vel)
+    expected = torch.tensor(
+        [[7.0, -8.0, 9.0, -10.0, 11.0, -12.0, 1.0, -2.0, 3.0, -4.0, 5.0, -6.0]]
+    )
+
+    assert torch.allclose(mirrored, expected)
+    assert torch.allclose(
+        symmetry_utils.mirror_obs_right_foot_vel(right_vel),
+        torch.tensor([[1.0, -2.0, 3.0, -4.0, 5.0, -6.0]]),
+    )
+
+
 def test_consistency_between_observation_dims_and_indices(mock_env_with_history):
     """Test that observation dimensions and indices are consistent."""
     symmetry_utils = SymmetryUtils(mock_env_with_history)

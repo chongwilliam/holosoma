@@ -16,6 +16,7 @@ from holosoma.bridge import BasicSdk2Bridge, create_sdk2py_bridge
 from holosoma.config_types.simulator import BridgeConfig
 from holosoma.utils.clock import ClockPub
 from holosoma.utils.safe_torch_import import torch
+from holosoma.utils.wbc_state import WbcStatePub
 
 if TYPE_CHECKING:
     from holosoma.simulator.base_simulator.base_simulator import BaseSimulator
@@ -53,6 +54,7 @@ class SimulatorBridge:
 
         # Initialize clock publisher for WBT motion synchronization
         self.clock_pub: ClockPub = ClockPub()
+        self.wbc_state_pub: WbcStatePub = WbcStatePub()
 
         if self.bridge_config.interface is None:
             interface = self._auto_detect_interface()
@@ -65,6 +67,8 @@ class SimulatorBridge:
             # Start clock publisher for motion synchronization
             self.clock_pub.start()
             logger.info("Clock publisher initialized for motion synchronization")
+            self.wbc_state_pub.start()
+            logger.info("WBC state publisher initialized for task-space torque inference")
         else:
             # We don't support runtime toggling on/off
             logger.info("Robot bridge disabled")
@@ -144,6 +148,29 @@ class SimulatorBridge:
         # Publish simulation clock for e.g, WBT policies
         sim_time = self.simulator.time()
         self.clock_pub.publish(sim_time)
+        self._publish_wbc_state(sim_time)
+
+    def _publish_wbc_state(self, sim_time: float) -> None:
+        """Publish simulator-only state that task-space WBC inference needs."""
+        try:
+            simulator = self.simulator
+            payload = {
+                "time": float(sim_time),
+                "root_state": simulator.robot_root_states[0].detach().cpu().tolist(),
+                "dof_pos": simulator.dof_pos[0].detach().cpu().tolist(),
+                "dof_vel": simulator.dof_vel[0].detach().cpu().tolist(),
+                "right_contact_point": simulator.right_foot_contact_position[0].detach().cpu().tolist(),
+                "left_contact_point": simulator.left_foot_contact_position[0].detach().cpu().tolist(),
+                "right_contact_basis": simulator.right_foot_contact_basis[0].detach().cpu().tolist(),
+                "left_contact_basis": simulator.left_foot_contact_basis[0].detach().cpu().tolist(),
+                "right_grf": simulator.get_local_foot_force_sensor_wrench("right", 0).detach().cpu().tolist(),
+                "left_grf": simulator.get_local_foot_force_sensor_wrench("left", 0).detach().cpu().tolist(),
+            }
+        except Exception as exc:
+            logger.debug(f"Skipping WBC state publish: {exc}")
+            return
+
+        self.wbc_state_pub.publish(payload)
 
     def is_enabled(self) -> bool:
         """Check if the bridge is enabled and functional.

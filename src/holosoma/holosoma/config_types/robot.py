@@ -33,8 +33,8 @@ class RobotControlConfig:
     control_type: str
     stiffness: dict[str, float]
     damping: dict[str, float]
-    action_scale: float
-    action_clip_value: float
+    action_scale: float | list[float]
+    action_clip_value: float | list[float]
     clip_actions: bool
     clip_torques: bool
     action_scales_by_effort_limit_over_p_gain: bool = False

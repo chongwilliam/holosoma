@@ -806,6 +806,9 @@ class MuJoCo(BaseSimulator):
         self._rigid_body_ang_vel = torch.zeros(
             self.num_envs, self.num_bodies, 3, device=self.sim_device, dtype=torch.float32
         )
+        self.com_pos = torch.zeros(self.num_envs, 3, device=self.sim_device, dtype=torch.float32)
+        self.com_lin_vel = torch.zeros(self.num_envs, 3, device=self.sim_device, dtype=torch.float32)
+        self.com_vel = self.com_lin_vel
         self._initialize_foot_contact_buffers()
         self._foot_body_indices = self._find_foot_body_indices()
 
@@ -858,6 +861,17 @@ class MuJoCo(BaseSimulator):
             self._rigid_body_rot[:] = orientations
             self._rigid_body_vel[:] = linear_vel
             self._rigid_body_ang_vel[:] = angular_vel
+            robot_body_id = 1  # Robot root body; body 0 is the MuJoCo world body.
+            com_pos = self.backend.get_subtree_com_pos_view(robot_body_id)
+            if com_pos is not None:
+                self.com_pos[:] = com_pos
+            else:
+                self.com_pos[:] = self._rigid_body_pos.mean(dim=1)
+            com_lin_vel = self.backend.get_subtree_com_lin_vel_view(robot_body_id)
+            if com_lin_vel is not None:
+                self.com_lin_vel[:] = com_lin_vel
+            else:
+                self.com_lin_vel[:] = self._rigid_body_vel.mean(dim=1)
         else:
             # Slow path: CPU loop with tensor allocation (ClassicBackend)
             assert self.root_model
@@ -888,6 +902,17 @@ class MuJoCo(BaseSimulator):
                 # Extract angular and linear velocities
                 self._rigid_body_ang_vel[0, body_id] = torch.from_numpy(body_vel[:3]).float().to(self.sim_device)
                 self._rigid_body_vel[0, body_id] = torch.from_numpy(body_vel[3:]).float().to(self.sim_device)
+
+            robot_body_id = 1  # Robot root body; body 0 is the MuJoCo world body.
+            if robot_body_id < self.root_model.nbody:
+                self.com_pos[0] = torch.from_numpy(self.root_data.subtree_com[robot_body_id]).float().to(self.sim_device)
+                mujoco.mj_subtreeVel(self.root_model, self.root_data)
+                self.com_lin_vel[0] = (
+                    torch.from_numpy(self.root_data.subtree_linvel[robot_body_id]).float().to(self.sim_device)
+                )
+            else:
+                self.com_pos[0] = self._rigid_body_pos[0].mean(dim=0)
+                self.com_lin_vel[0] = self._rigid_body_vel[0].mean(dim=0)
 
         # Update contact forces and history via backend delegation
         if hasattr(self, "contact_forces_history") and hasattr(self, "contact_forces"):
@@ -924,20 +949,43 @@ class MuJoCo(BaseSimulator):
         half_length = 0.5 * float(self.robot_config.foot_dimension[0])
         half_width = 0.5 * float(self.robot_config.foot_dimension[1])
         eps = float(self.simulator_config.contact_support.eps)
-        normal_force_threshold = 1.0
+        normal_force_threshold = float(self.simulator_config.contact_support.normal_force_threshold)
 
         for side in ("right", "left"):
             metadata = self._get_foot_force_sensor_metadata(side)
             force_adr = metadata["force_adr"]
             torque_adr = metadata["torque_adr"]
+            foot_body_idx = self._foot_body_indices[side]
 
             for env_idx in range(self.num_envs):
+                contact_wrench = self.contact_forces[env_idx, foot_body_idx, :3]
+                if float(torch.linalg.vector_norm(contact_wrench).item()) <= normal_force_threshold:
+                    self._set_filtered_foot_contact_summary(
+                        side,
+                        env_idx,
+                        foot_center,
+                        torch.zeros(3, device=self.sim_device, dtype=torch.float32),
+                        0,
+                        foot_center,
+                    )
+                    continue
+
                 sensordata = sensordata_by_env[env_idx]
-                force_site = sensordata[force_adr : force_adr + 3].to(device=self.sim_device, dtype=torch.float32)
-                torque_site = sensordata[torque_adr : torque_adr + 3].to(device=self.sim_device, dtype=torch.float32)
+                force_site = - sensordata[force_adr : force_adr + 3].to(device=self.sim_device, dtype=torch.float32)
+                torque_site = - sensordata[torque_adr : torque_adr + 3].to(device=self.sim_device, dtype=torch.float32)
+
+                # print("force site from mujoco: ", force_site)  # verified to be positive w/ sign flip
 
                 fz = float(force_site[2].item())
                 if abs(fz) <= normal_force_threshold:
+                    self._set_filtered_foot_contact_summary(
+                        side,
+                        env_idx,
+                        foot_center,
+                        torch.zeros(3, device=self.sim_device, dtype=torch.float32),
+                        0,
+                        foot_center,
+                    )
                     continue
 
                 # Resolve CoP in the local foot sensor frame from the local torque about x/y.
@@ -981,14 +1029,96 @@ class MuJoCo(BaseSimulator):
                         support_axes[1] = 1.0
                         support_axes[2] = 1.0
 
-                if side == "right":
-                    self.right_foot_contact_position[env_idx, :] = contact_position
-                    self.right_foot_contact_basis[env_idx, :] = support_axes
-                    self.right_foot_contact_count[env_idx] = 1
-                else:
-                    self.left_foot_contact_position[env_idx, :] = contact_position
-                    self.left_foot_contact_basis[env_idx, :] = support_axes
-                    self.left_foot_contact_count[env_idx] = 1
+                self._set_filtered_foot_contact_summary(
+                    side,
+                    env_idx,
+                    contact_position,
+                    support_axes,
+                    1,
+                    foot_center,
+                )
+
+    def _set_filtered_foot_contact_summary(
+        self,
+        side: str,
+        env_idx: int,
+        raw_position: torch.Tensor,
+        raw_basis: torch.Tensor,
+        raw_count: int,
+        foot_center: torch.Tensor,
+    ) -> None:
+        side_idx = 0 if side == "right" else 1
+        raw_position = raw_position.to(device=self.sim_device, dtype=torch.float32)
+        raw_basis = raw_basis.to(device=self.sim_device, dtype=torch.float32)
+        foot_center = foot_center.to(device=self.sim_device, dtype=torch.float32)
+
+        if raw_count <= 0:
+            filtered_position = foot_center
+            filtered_basis = torch.zeros(3, device=self.sim_device, dtype=torch.float32)
+            self._foot_contact_filter_initialized[env_idx, side_idx] = False
+            self._foot_contact_filtered_position[env_idx, side_idx] = filtered_position
+            self._foot_contact_filtered_basis[env_idx, side_idx] = filtered_basis
+            self._foot_contact_candidate_basis[env_idx, side_idx] = filtered_basis
+            self._foot_contact_candidate_basis_steps[env_idx, side_idx] = 0
+            self._write_foot_contact_summary(side, env_idx, filtered_position, filtered_basis, 0)
+            return
+
+        alpha = float(self.simulator_config.contact_support.position_filter_alpha)
+        alpha = min(max(alpha, 0.0), 1.0)
+        initialized = bool(self._foot_contact_filter_initialized[env_idx, side_idx].item())
+        if not initialized or alpha >= 1.0:
+            filtered_position = raw_position
+            self._foot_contact_filter_initialized[env_idx, side_idx] = True
+        elif alpha <= 0.0:
+            filtered_position = self._foot_contact_filtered_position[env_idx, side_idx]
+        else:
+            previous_position = self._foot_contact_filtered_position[env_idx, side_idx]
+            filtered_position = (1.0 - alpha) * previous_position + alpha * raw_position
+        self._foot_contact_filtered_position[env_idx, side_idx] = filtered_position
+
+        debounce_steps = max(1, int(self.simulator_config.contact_support.basis_debounce_steps))
+        committed_basis = self._foot_contact_filtered_basis[env_idx, side_idx]
+        candidate_basis = self._foot_contact_candidate_basis[env_idx, side_idx]
+        if not initialized:
+            filtered_basis = raw_basis
+            self._foot_contact_candidate_basis[env_idx, side_idx] = raw_basis
+            self._foot_contact_candidate_basis_steps[env_idx, side_idx] = 0
+        elif bool(torch.equal(raw_basis, committed_basis)):
+            filtered_basis = committed_basis
+            self._foot_contact_candidate_basis[env_idx, side_idx] = raw_basis
+            self._foot_contact_candidate_basis_steps[env_idx, side_idx] = 0
+        else:
+            if bool(torch.equal(raw_basis, candidate_basis)):
+                self._foot_contact_candidate_basis_steps[env_idx, side_idx] += 1
+            else:
+                self._foot_contact_candidate_basis[env_idx, side_idx] = raw_basis
+                self._foot_contact_candidate_basis_steps[env_idx, side_idx] = 1
+
+            if int(self._foot_contact_candidate_basis_steps[env_idx, side_idx].item()) >= debounce_steps:
+                filtered_basis = raw_basis
+                self._foot_contact_candidate_basis_steps[env_idx, side_idx] = 0
+            else:
+                filtered_basis = committed_basis
+
+        self._foot_contact_filtered_basis[env_idx, side_idx] = filtered_basis
+        self._write_foot_contact_summary(side, env_idx, filtered_position, filtered_basis, 1)
+
+    def _write_foot_contact_summary(
+        self,
+        side: str,
+        env_idx: int,
+        position: torch.Tensor,
+        basis: torch.Tensor,
+        count: int,
+    ) -> None:
+        if side == "right":
+            self.right_foot_contact_position[env_idx, :] = position
+            self.right_foot_contact_basis[env_idx, :] = basis
+            self.right_foot_contact_count[env_idx] = count
+        else:
+            self.left_foot_contact_position[env_idx, :] = position
+            self.left_foot_contact_basis[env_idx, :] = basis
+            self.left_foot_contact_count[env_idx] = count
 
     def apply_torques_at_dof(self, torques: torch.Tensor) -> None:
         """Apply torques with backend-specific optimization.
@@ -1052,7 +1182,7 @@ class MuJoCo(BaseSimulator):
 
         # Call video recorder capture frame if recording is active
         if self.video_recorder and self.video_recorder.is_recording:
-            self.capture_video_frame()
+            self.capture_video_frame(self.video_recorder.record_env_id)
 
     def get_actor_states_by_index(self, indices: ActorIndices) -> ActorStates:
         """Get actor states using MuJoCo best practices with robot-only validation.
@@ -1588,6 +1718,35 @@ class MuJoCo(BaseSimulator):
 
         assert self.root_data is not None
         return torch.from_numpy(self.root_data.actuator_force[: self.num_dof]).float().to(self.sim_device)
+
+    def get_local_foot_force_sensor_wrench(self, side: str, env_id: int = 0) -> torch.Tensor:
+        """Return foot force-torque sensor data expressed in the sensor-local frame."""
+        metadata = self._get_foot_force_sensor_metadata(side)
+        force_adr = metadata["force_adr"]
+        torque_adr = metadata["torque_adr"]
+
+        if self.simulator_config.mujoco_backend == MujocoBackend.WARP:
+            if env_id < 0 or env_id >= self.num_envs:
+                raise RuntimeError(f"Invalid MuJoCo Warp env_id={env_id}; expected [0, {self.num_envs - 1}].")
+            if not hasattr(self.backend, "sensordata_t") or not hasattr(self.backend, "site_xmat_t"):
+                raise RuntimeError("MuJoCo WarpBackend does not expose force sensor tensors.")
+
+            sensordata = self.backend.sensordata_t[env_id]  # type: ignore[attr-defined]
+            force_site = sensordata[force_adr : force_adr + 3]
+            torque_site = sensordata[torque_adr : torque_adr + 3]
+
+            return torch.cat([force_site, torque_site], dim=0).to(device=self.sim_device, dtype=torch.float32)
+
+        if env_id != 0:
+            raise RuntimeError(f"MuJoCo classic currently only supports single environment (env_id=0), got {env_id}")
+
+        assert self.root_data is not None
+
+        force_site = self.root_data.sensordata[force_adr : force_adr + 3]
+        torque_site = self.root_data.sensordata[torque_adr : torque_adr + 3]
+
+        wrench_world = np.concatenate([force_site, torque_site], axis=0)
+        return torch.from_numpy(wrench_world).to(device=self.sim_device, dtype=torch.float32)
 
     def get_foot_force_sensor_wrench(self, side: str, env_id: int = 0) -> torch.Tensor:
         """Return foot force-torque sensor data expressed in the world frame."""

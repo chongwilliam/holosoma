@@ -143,7 +143,8 @@ Changed group of some visual geoms to support ray-tracing that passes through ro
 
     <worldbody>
         <body name="pelvis" pos="0 0 0.793" childclass="g1_29dof">
-            <inertial pos="0 0 -0.07605" quat="1 0 -0.000399148 0" mass="3.813" diaginertia="0.010549 0.0093089 0.0079184"/>
+        <!-- <body name="pelvis" pos="0 0 0" childclass="g1_29dof"> -->
+            <inertial pos="0 0 -0.07605" quat="1 0 0 0" mass="3.813" diaginertia="0.010549 0.0093089 0.0079184"/>
             <freejoint name="floating_base_joint"/>
             <geom class="visual" material="black" mesh="pelvis"/>
             <geom class="visual" mesh="pelvis_contour_link"/>

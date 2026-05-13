@@ -9,10 +9,21 @@ from typing_extensions import Annotated
 from holosoma_inference.config.config_types.inference import InferenceConfig
 from holosoma_inference.config.config_values import observation, robot, task
 
+g1_loco_task_space_action_scale = (
+    0.1, 0.1, 0.05,  # pelvis linear velocity residual: vx, vy, vz
+    0.001, 0.001, 0.001,  # pelvis angular velocity residual: wx, wy, wz
+    0.1, 0.1, 0.05,  # COM velocity residual: vx, vy, vz
+    0.1, 0.1, 0.05,  # landing foot residual: dx, dy, dyaw
+)
+
 g1_29dof_loco = InferenceConfig(
     robot=robot.g1_29dof,
     observation=observation.loco_g1_29dof,
-    task=task.locomotion,
+    task=replace(
+        task.locomotion,
+        policy_action_scale=g1_loco_task_space_action_scale,
+        policy_action_space="task_space",
+    ),
 )
 
 t1_29dof_loco = InferenceConfig(

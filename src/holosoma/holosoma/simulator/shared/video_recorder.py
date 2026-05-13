@@ -74,6 +74,7 @@ class VideoRecorderInterface(ABC):
         """
         self.config = config
         self.simulator = simulator
+        self.record_env_id = int(config.record_env_id)
         self._is_recording = False
         self._current_episode = 0
         self._total_episodes = 0
@@ -118,9 +119,9 @@ class VideoRecorderInterface(ABC):
         """
         try:
             # Only create camera for the recording environment (typically env 0)
-            if self.config.record_env_id >= self.simulator.num_envs:
+            if self.record_env_id >= self.simulator.num_envs:
                 raise RuntimeError(
-                    f"Record environment ID {self.config.record_env_id} exceeds available environments "
+                    f"Record environment ID {self.record_env_id} exceeds available environments "
                     f"({self.simulator.num_envs})"
                 )
 
@@ -187,7 +188,7 @@ class VideoRecorderInterface(ABC):
             The environment ID where the frame is being captured.
         """
         # Only capture frames when recording is active and from the correct environment
-        if not self._is_recording or env_id != self.config.record_env_id:
+        if not self._is_recording or env_id != self.record_env_id:
             return
 
         # Increment frame counter for decimation tracking
@@ -333,7 +334,7 @@ class VideoRecorderInterface(ABC):
             The environment ID where the episode is starting.
         """
         # Only record from the specified environment
-        if env_id != self.config.record_env_id:
+        if env_id != self.record_env_id:
             return
 
         # Increment total episode count (across all environments)
@@ -350,7 +351,7 @@ class VideoRecorderInterface(ABC):
         if it was active for the current episode.
         """
         # Only stop for the specified environment
-        if env_id != self.config.record_env_id:
+        if env_id != self.record_env_id:
             return
 
         # Let stop_recording() handle the recording state check
@@ -366,6 +367,13 @@ class VideoRecorderInterface(ABC):
             True if currently recording, False otherwise.
         """
         return self._is_recording
+
+    def set_record_env_id(self, env_id: int) -> None:
+        """Switch the environment used for video capture."""
+        if env_id < 0 or env_id >= self.simulator.num_envs:
+            logger.warning(f"Cannot record env {env_id}; valid range is [0, {self.simulator.num_envs - 1}]")
+            return
+        self.record_env_id = int(env_id)
 
     def _get_save_directory(self) -> Path:
         """Get the directory for saving video files.
@@ -474,8 +482,7 @@ class VideoRecorderInterface(ABC):
         """
         # For video recording, we want to use the record_env_id
         if robot_pos is None:
-            record_env_id = self.config.record_env_id
-            robot_pos_array = self.simulator.robot_root_states[record_env_id, :3]
+            robot_pos_array = self.simulator.robot_root_states[self.record_env_id, :3]
             robot_pos = (float(robot_pos_array[0]), float(robot_pos_array[1]), float(robot_pos_array[2]))
 
         return self.camera_controller.update(robot_pos=robot_pos)
@@ -498,8 +505,7 @@ class VideoRecorderInterface(ABC):
         if not self.config.show_command_overlay:
             return image_rgb
 
-        record_env_id = self.config.record_env_id
-        command_text = format_command_labels(getattr(self.simulator, "commands", None), env_id=record_env_id)
+        command_text = format_command_labels(getattr(self.simulator, "commands", None), env_id=self.record_env_id)
         return overlay_text_on_image(image_rgb.copy(), command_text, position=(50, 50), font_scale=0.8)
 
     # ===== Impl Functions (can be overridden) =====

@@ -4,6 +4,12 @@ from typing import Any, Dict, List, Sequence
 
 import torch
 
+WBC_TASK_SPACE_ACTION_DIM = 12
+WBC_PELVIS_LIN_VEL_SLICE = slice(0, 3)
+WBC_PELVIS_ANG_VEL_SLICE = slice(3, 6)
+WBC_COM_VEL_SLICE = slice(6, 9)
+WBC_LANDING_DELTA_SLICE = slice(9, 12)
+
 
 class SymmetryUtils:
     """Symmetry utilities for humanoid robots using configuration-driven approach.
@@ -265,11 +271,28 @@ class SymmetryUtils:
             mirrored_obs = mirrored_obs.reshape(
                 B, self.history_lengths[obs_key], self.observation_dims_single_frame[obs_key]
             )
+            original_obs = mirrored_obs.clone()
             # Apply mirroring to each sub-observation component using single-frame indices
             for sub_obs_key in self.sub_observation_keys[obs_key]:
-                mirrored_obs[..., self.sub_observation_indices_single_frame[obs_key][sub_obs_key]] = getattr(
-                    self, f"mirror_obs_{sub_obs_key}"
-                )(mirrored_obs[..., self.sub_observation_indices_single_frame[obs_key][sub_obs_key]])
+                source_obs_key = {
+                    "right_foot_pos": "left_foot_pos",
+                    "right_foot_ori": "left_foot_ori",
+                    "right_foot_lin_vel": "left_foot_lin_vel",
+                    "right_foot_ang_vel": "left_foot_ang_vel",
+                    "right_foot_vel": "left_foot_vel",
+                    "left_foot_pos": "right_foot_pos",
+                    "left_foot_ori": "right_foot_ori",
+                    "left_foot_lin_vel": "right_foot_lin_vel",
+                    "left_foot_ang_vel": "right_foot_ang_vel",
+                    "left_foot_vel": "right_foot_vel",
+                }.get(sub_obs_key)
+                if source_obs_key not in self.sub_observation_indices_single_frame[obs_key]:
+                    source_obs_key = sub_obs_key
+                target_idx = self.sub_observation_indices_single_frame[obs_key][sub_obs_key]
+                source_idx = self.sub_observation_indices_single_frame[obs_key][source_obs_key]
+                mirrored_obs[..., target_idx] = getattr(self, f"mirror_obs_{sub_obs_key}")(
+                    original_obs[..., source_idx]
+                )
             mirrored_obs_all[..., idx : idx + cur_obs_length] = mirrored_obs.reshape(B, cur_obs_length)
             idx += cur_obs_length
 
@@ -291,45 +314,31 @@ class SymmetryUtils:
             Joint mappings are applied and signs are flipped as appropriate.
             Returns [a_mapped0 * sign0, a_mapped1 * sign1, ..., a_mappedN * signN] (mirrored and sign-flipped).
         """
-        if action.shape[-1] == 21:
+        if action.shape[-1] == WBC_TASK_SPACE_ACTION_DIM:
             return self._mirror_wbc_task_space_action(action)
 
         if action.shape[-1] != self.joint_index_map.shape[0]:
             raise ValueError(
                 f"Unsupported action dimension for symmetry augmentation: got {action.shape[-1]}, "
-                f"expected 21 for WBC task-space actions or {self.joint_index_map.shape[0]} for joint-space actions."
+                f"expected {WBC_TASK_SPACE_ACTION_DIM} for WBC task-space actions or "
+                f"{self.joint_index_map.shape[0]} for joint-space actions."
             )
 
         return action[..., self.joint_index_map] * self.sign_flip_mask
 
     def _mirror_wbc_task_space_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Mirror the 21-D WBC task-space action layout used by JointTorqueActionTerm.
+        """Mirror WBC actions: [pelvis_lin_vel, pelvis_ang_vel, com_vel, landing_foot_delta_xyyaw]."""
+        if action.shape[-1] != WBC_TASK_SPACE_ACTION_DIM:
+            raise ValueError(
+                f"Unsupported WBC task-space action dimension: got {action.shape[-1]}, "
+                f"expected {WBC_TASK_SPACE_ACTION_DIM}."
+            )
 
-        Layout:
-        [com_pos(3), pelvis_axis_angle(3), torso_axis_angle(3),
-         right_foot_pos(3), right_foot_axis_angle(3),
-         left_foot_pos(3), left_foot_axis_angle(3)]
-        """
         mirrored = action.clone()
-
-        def mirror_position(vec: torch.Tensor) -> torch.Tensor:
-            out = vec.clone()
-            out[..., 1] = -out[..., 1]
-            return out
-
-        def mirror_axis_angle(vec: torch.Tensor) -> torch.Tensor:
-            out = vec.clone()
-            out[..., 0] = -out[..., 0]
-            out[..., 2] = -out[..., 2]
-            return out
-
-        mirrored[..., 0:3] = mirror_position(action[..., 0:3])
-        mirrored[..., 3:6] = mirror_axis_angle(action[..., 3:6])
-        mirrored[..., 6:9] = mirror_axis_angle(action[..., 6:9])
-        mirrored[..., 9:12] = mirror_position(action[..., 15:18])
-        mirrored[..., 12:15] = mirror_axis_angle(action[..., 18:21])
-        mirrored[..., 15:18] = mirror_position(action[..., 9:12])
-        mirrored[..., 18:21] = mirror_axis_angle(action[..., 12:15])
+        mirrored[..., WBC_PELVIS_LIN_VEL_SLICE] = self._mirror_wbc_position(action[..., WBC_PELVIS_LIN_VEL_SLICE])
+        mirrored[..., WBC_PELVIS_ANG_VEL_SLICE] = self._mirror_wbc_axis_angle(action[..., WBC_PELVIS_ANG_VEL_SLICE])
+        mirrored[..., WBC_COM_VEL_SLICE] = self._mirror_wbc_position(action[..., WBC_COM_VEL_SLICE])
+        mirrored[..., WBC_LANDING_DELTA_SLICE] = self._mirror_wbc_landing_delta(action[..., WBC_LANDING_DELTA_SLICE])
         return mirrored
 
     def mirror_obs_base_lin_vel(self, base_lin_vel: torch.Tensor) -> torch.Tensor:
@@ -490,10 +499,14 @@ class SymmetryUtils:
         Returns
         -------
         torch.Tensor
-            Mirrored phase with first component negated: [-sin(φ_left), sin(φ_right), ...].
+            Mirrored phase with left/right components swapped.
         """
-        sin_phase[..., 0] = -sin_phase[..., 0]
-        return sin_phase
+        if sin_phase.shape[-1] < 2:
+            return sin_phase.clone()
+        mirrored = sin_phase.clone()
+        mirrored[..., 0] = sin_phase[..., 1]
+        mirrored[..., 1] = sin_phase[..., 0]
+        return mirrored
 
     def mirror_obs_cos_phase(self, cos_phase: torch.Tensor) -> torch.Tensor:
         """Mirrors the cosine phase for gait timing.
@@ -506,10 +519,14 @@ class SymmetryUtils:
         Returns
         -------
         torch.Tensor
-            Mirrored phase with first component negated: [-cos(φ_left), cos(φ_right), ...].
+            Mirrored phase with left/right components swapped.
         """
-        cos_phase[..., 0] = -cos_phase[..., 0]
-        return cos_phase
+        if cos_phase.shape[-1] < 2:
+            return cos_phase.clone()
+        mirrored = cos_phase.clone()
+        mirrored[..., 0] = cos_phase[..., 1]
+        mirrored[..., 1] = cos_phase[..., 0]
+        return mirrored
 
     def mirror_obs_dof_pos(self, dof_pos: torch.Tensor) -> torch.Tensor:
         """Mirrors the joint positions using joint mapping and sign flipping.
@@ -561,16 +578,141 @@ class SymmetryUtils:
             Mirrored actions with same transformation as joint positions.
             Outputs: [a_mapped0 * sign0, a_mapped1 * sign1, ..., a_mappedN * signN] (mirrored and sign-flipped).
         """
-        if actions.shape[-1] == 21:
+        if actions.shape[-1] == WBC_TASK_SPACE_ACTION_DIM:
             return self._mirror_wbc_task_space_action(actions)
 
         if actions.shape[-1] != self.joint_index_map.shape[0]:
             raise ValueError(
                 f"Unsupported action observation dimension for symmetry augmentation: got {actions.shape[-1]}, "
-                f"expected 21 for WBC task-space actions or {self.joint_index_map.shape[0]} for joint-space actions."
+                f"expected {WBC_TASK_SPACE_ACTION_DIM} for WBC task-space actions or "
+                f"{self.joint_index_map.shape[0]} for joint-space actions."
             )
 
         return actions[..., self.joint_index_map] * self.sign_flip_mask
+
+    def mirror_obs_com_pos(self, com_pos: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_position(com_pos)
+
+    def mirror_obs_com_lin_vel(self, com_lin_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_position(com_lin_vel)
+
+    def mirror_obs_com_vel(self, com_vel: torch.Tensor) -> torch.Tensor:
+        if com_vel.shape[-1] == 2:
+            return self._mirror_wbc_planar_velocity(com_vel)
+        return self._mirror_wbc_position(com_vel)
+
+    def mirror_obs_pelvis_ori(self, pelvis_ori: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(pelvis_ori)
+
+    def mirror_obs_pelvis_ang_vel(self, pelvis_ang_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(pelvis_ang_vel)
+
+    def mirror_obs_torso_ori(self, torso_ori: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(torso_ori)
+
+    def mirror_obs_torso_ang_vel(self, torso_ang_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(torso_ang_vel)
+
+    def mirror_obs_torso_yaw_vel(self, torso_yaw_vel: torch.Tensor) -> torch.Tensor:
+        out = torso_yaw_vel.clone()
+        out[..., 0] = -out[..., 0]
+        return out
+
+    def mirror_obs_landing_foot_delta_pose(self, landing_foot_delta_pose: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_landing_delta(landing_foot_delta_pose)
+
+    def mirror_obs_landing_foot_delta(self, landing_foot_delta: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_landing_delta(landing_foot_delta)
+
+    def mirror_obs_foot_pos(self, foot_pos: torch.Tensor) -> torch.Tensor:
+        mirrored = foot_pos.clone()
+        mirrored[..., 0:3] = self._mirror_wbc_position(foot_pos[..., 3:6])
+        mirrored[..., 3:6] = self._mirror_wbc_position(foot_pos[..., 0:3])
+        return mirrored
+
+    def mirror_obs_foot_ori(self, foot_ori: torch.Tensor) -> torch.Tensor:
+        mirrored = foot_ori.clone()
+        mirrored[..., 0:3] = self._mirror_wbc_axis_angle(foot_ori[..., 3:6])
+        mirrored[..., 3:6] = self._mirror_wbc_axis_angle(foot_ori[..., 0:3])
+        return mirrored
+
+    def mirror_obs_foot_vel(self, foot_vel: torch.Tensor) -> torch.Tensor:
+        if foot_vel.shape[-1] != 12:
+            raise ValueError(
+                f"Expected combined right/left foot velocity dimension 12, got {foot_vel.shape[-1]}."
+            )
+
+        mirrored = foot_vel.clone()
+        mirrored[..., 0:6] = self._mirror_wbc_spatial_velocity(foot_vel[..., 6:12])
+        mirrored[..., 6:12] = self._mirror_wbc_spatial_velocity(foot_vel[..., 0:6])
+        return mirrored
+
+    def mirror_obs_right_foot_pos(self, right_foot_pos: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_position(right_foot_pos)
+
+    def mirror_obs_right_foot_lin_vel(self, right_foot_lin_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_position(right_foot_lin_vel)
+
+    def mirror_obs_right_foot_ori(self, right_foot_ori: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(right_foot_ori)
+
+    def mirror_obs_right_foot_ang_vel(self, right_foot_ang_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(right_foot_ang_vel)
+
+    def mirror_obs_right_foot_vel(self, right_foot_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_spatial_velocity(right_foot_vel)
+
+    def mirror_obs_left_foot_pos(self, left_foot_pos: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_position(left_foot_pos)
+
+    def mirror_obs_left_foot_lin_vel(self, left_foot_lin_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_position(left_foot_lin_vel)
+
+    def mirror_obs_left_foot_ori(self, left_foot_ori: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(left_foot_ori)
+
+    def mirror_obs_left_foot_ang_vel(self, left_foot_ang_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_axis_angle(left_foot_ang_vel)
+
+    def mirror_obs_left_foot_vel(self, left_foot_vel: torch.Tensor) -> torch.Tensor:
+        return self._mirror_wbc_spatial_velocity(left_foot_vel)
+
+    def _mirror_wbc_planar_velocity(self, vec: torch.Tensor) -> torch.Tensor:
+        if vec.shape[-1] != 2:
+            raise ValueError(f"Expected planar velocity dimension 2, got {vec.shape[-1]}.")
+
+        out = vec.clone()
+        out[..., 1] = -out[..., 1]
+        return out
+
+    def _mirror_wbc_landing_delta(self, vec: torch.Tensor) -> torch.Tensor:
+        if vec.shape[-1] != 3:
+            raise ValueError(f"Expected landing-foot delta dimension 3, got {vec.shape[-1]}.")
+
+        out = vec.clone()
+        out[..., 1] = -out[..., 1]
+        out[..., 2] = -out[..., 2]
+        return out
+
+    def _mirror_wbc_spatial_velocity(self, vec: torch.Tensor) -> torch.Tensor:
+        if vec.shape[-1] != 6:
+            raise ValueError(f"Expected spatial velocity dimension 6, got {vec.shape[-1]}.")
+
+        out = vec.clone()
+        out[..., 0:3] = self._mirror_wbc_position(vec[..., 0:3])
+        out[..., 3:6] = self._mirror_wbc_axis_angle(vec[..., 3:6])
+        return out
+
+    def _mirror_wbc_position(self, vec: torch.Tensor) -> torch.Tensor:
+        out = vec.clone()
+        out[..., 1] = -out[..., 1]
+        return out
+
+    def _mirror_wbc_axis_angle(self, vec: torch.Tensor) -> torch.Tensor:
+        out = vec.clone()
+        out[..., 0] = -out[..., 0]
+        out[..., 2] = -out[..., 2]
+        return out
 
     def mirror_obs_ee_apply_force(self, ee_apply_force: torch.Tensor) -> torch.Tensor:
         """Mirrors the end-effector applied forces in base frame.

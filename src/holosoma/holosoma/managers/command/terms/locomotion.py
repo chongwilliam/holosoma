@@ -209,7 +209,7 @@ class LocomotionGait(CommandTermBase):
             self.phase_offset[idx, 0] = torch_rand_float(
                 -torch.pi, torch.pi, (idx.shape[0], 1), device=self.env.device
             ).squeeze(1)
-            self.phase_offset[idx, 1] = torch.fmod(self.phase_offset[idx, 0] + 2 * torch.pi, 2 * torch.pi) - torch.pi
+            self.phase_offset[idx, 1] = torch.fmod(self.phase_offset[idx, 0] + torch.pi, 2 * torch.pi) - torch.pi
         else:
             self.phase_offset[idx] = 0.0
 

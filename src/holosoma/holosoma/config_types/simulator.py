@@ -478,6 +478,15 @@ class ContactSupportConfig:
     eps_det: float = 1.0e-10
     """Minimum 2D covariance determinant required to mark yaw support."""
 
+    normal_force_threshold: float = 20.0
+    """Minimum foot normal/contact force magnitude used to mark a foot as in contact."""
+
+    position_filter_alpha: float = 0.25
+    """EMA coefficient for active foot contact positions. Set to 1.0 to disable smoothing."""
+
+    basis_debounce_steps: int = 3
+    """Consecutive raw observations required before changing the discrete contact angular basis."""
+
 
 @dataclass(frozen=True)
 class SimulatorInitConfig:

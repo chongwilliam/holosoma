@@ -1,15 +1,8 @@
-"""Run a single G1 environment with the torque-control WBC action term.
-
-This script is intended as a small standing-start smoke test for the G1 WBC
-integration. It manually computes and applies WBC torques so that the test can
-compare the batched and scalar WBC command paths without going through the full
-RL action loop.
-"""
-
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 import sys
 from pathlib import Path
 
@@ -32,16 +25,19 @@ from holosoma.managers.action.terms.torque_control import root_states_to_xyz_rpy
 from holosoma.utils.safe_torch_import import torch
 from holosoma.utils.sim_utils import close_simulation_app, setup_simulation_environment
 
+
 def _resolve_path(path_str: str | None) -> str | None:
     if path_str is None:
         return None
     return str(Path(path_str).expanduser().resolve())
+
 
 def _existing_default(*paths: Path) -> str:
     for path in paths:
         if path.exists():
             return str(path)
     return str(paths[0])
+
 
 def _build_action_cfg(wbc_extension_dir: str, robot_file: str, yaml_file: str, robot_name: str) -> ActionManagerCfg:
     default_params = g1_loco_action.g1_29dof_torque.terms["torque_control"].params
@@ -66,6 +62,7 @@ def _build_action_cfg(wbc_extension_dir: str, robot_file: str, yaml_file: str, r
             ),
         }
     )
+
 
 def _build_config(
     *,
@@ -109,21 +106,15 @@ def _build_config(
         ),
     )
 
+
 def _format_tensor_row(row: torch.Tensor) -> str:
     values = [float(x) for x in row.detach().cpu().tolist()]
     return "[" + ", ".join(f"{value:.6f}" for value in values) + "]"
 
 
-def _expand_action_values(values: list[float], action_dim: int, label: str) -> list[float]:
-    if len(values) == 1:
-        return [float(values[0])] * action_dim
-    if len(values) == action_dim:
-        return [float(value) for value in values]
-    raise ValueError(f"{label} expects either 1 value or {action_dim} values, got {len(values)}.")
-
-
 def _root_pos(env) -> torch.Tensor:
     return env.simulator.robot_root_states[0, :3]
+
 
 def _force_single_env_origin_at_world(env) -> None:
     """Keep the one-env visual test near the world origin instead of a terrain tile."""
@@ -140,6 +131,7 @@ def _force_single_env_origin_at_world(env) -> None:
     scene_origins = getattr(scene, "env_origins", None)
     if scene_origins is not None:
         scene_origins.zero_()
+
 
 def _zero_reset_velocities(env) -> None:
     env_ids = torch.arange(env.num_envs, device=env.device)
@@ -159,6 +151,7 @@ def _zero_reset_velocities(env) -> None:
         dof_states_to_set = dof_states
     env.simulator.set_dof_state_tensor_robots(env_ids, dof_states_to_set)
     env.simulator.refresh_sim_tensors()
+
 
 def _reset_without_physics_step(env) -> None:
     """Reset managers and simulator state without applying the action term once."""
@@ -186,11 +179,14 @@ def _reset_without_physics_step(env) -> None:
     env.simulator.set_dof_state_tensor_robots(env_ids, dof_states_to_set)
     env.simulator.refresh_sim_tensors()
 
+
 def _contact_count(simulator, side: str) -> int:
     return int(getattr(simulator, f"{side}_foot_contact_count")[0].item())
 
+
 def _both_feet_in_contact(simulator) -> bool:
     return _contact_count(simulator, "right") > 0 and _contact_count(simulator, "left") > 0
+
 
 def _foot_grf(env, term, side: str) -> torch.Tensor:
     grf_fn = getattr(term, "_local_foot_force_sensor_wrench", None)
@@ -222,13 +218,16 @@ def _foot_grf(env, term, side: str) -> torch.Tensor:
         wrench = torch.cat([wrench, torch.zeros(3, device=wrench.device, dtype=wrench.dtype)], dim=0)
     return wrench[:6].to(device=env.device, dtype=torch.float32)
 
+
 def _state_tensor(value) -> torch.Tensor:
     tensor = value.clone() if hasattr(value, "clone") else torch.as_tensor(value)
     return tensor.detach() if hasattr(tensor, "detach") else tensor
 
+
 def _current_com_position(wbc_engine, device: str) -> torch.Tensor:
     com_pose = torch.as_tensor(wbc_engine.getPose("com"), device=device, dtype=torch.float32)
     return com_pose[:3, 3]
+
 
 def _current_wbc_state_arrays(env, term, device: str) -> tuple[np.ndarray, np.ndarray]:
     root_states = _state_tensor(env.simulator.robot_root_states).to(device=device, dtype=torch.float32)
@@ -239,6 +238,7 @@ def _current_wbc_state_arrays(env, term, device: str) -> tuple[np.ndarray, np.nd
     q = term._as_numpy_2d(q_tensor, "explicit_wbc_update_q")
     dq = term._as_numpy_2d(dq_tensor, "explicit_wbc_update_dq")
     return q, dq
+
 
 def _current_stance_support_inputs(env, term, env_idx: int = 0) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, bool, bool]:
     right_contact_points = term._as_numpy_2d(env.simulator.right_foot_contact_position, "explicit_right_contact_points")
@@ -263,6 +263,7 @@ def _current_stance_support_inputs(env, term, env_idx: int = 0) -> tuple[int, np
         in_transition,
     )
 
+
 def _draw_explicit_contact_visualization(
     term,
     right_contact_points: np.ndarray,
@@ -282,6 +283,7 @@ def _draw_explicit_contact_visualization(
             left_contact_points,
             left_contact_bases,
         )
+
 
 def _explicitly_update_stance_support(env, term, command: str) -> None:
     right_contact_points = term._as_numpy_2d(env.simulator.right_foot_contact_position, "explicit_right_contact_points")
@@ -325,12 +327,17 @@ def _explicitly_update_stance_support(env, term, command: str) -> None:
 
     raise ValueError(f"Unknown WBC command mode: {command}")
 
+
 def _explicitly_update_wbc_robot_state(env, term, command: str, device: str) -> None:
     q, dq = _current_wbc_state_arrays(env, term, device)
     if command == "single":
         engine = getattr(term, "_wbc_debug_engine", None)
         if engine is None:
             raise RuntimeError("JointTorqueActionTerm did not expose _wbc_debug_engine for --wbc-command single.")
+        print("q: ") 
+        print(q[0])
+        print("dq: ")
+        print(dq[0])
         engine.updateRobot(q[0], dq[0])
         _explicitly_update_stance_support(env, term, command)
         return
@@ -339,6 +346,41 @@ def _explicitly_update_wbc_robot_state(env, term, command: str, device: str) -> 
         _explicitly_update_stance_support(env, term, command)
         return
     raise ValueError(f"Unknown WBC command mode: {command}")
+
+
+def _get_pose_from_pybind(term, frame_names: tuple[str, ...], env_idx: int, label: str) -> np.ndarray:
+    debug_engine = getattr(term, "_wbc_debug_engine", None)
+    if env_idx == 0 and debug_engine is not None:
+        for frame_name in frame_names:
+            get_pose = getattr(debug_engine, "getPose", None)
+            if callable(get_pose):
+                try:
+                    pose = np.asarray(get_pose(frame_name), dtype=np.float64)
+                    if pose.shape == (4, 4) and np.all(np.isfinite(pose)):
+                        return pose
+                except Exception:
+                    pass
+
+    wbc = getattr(term, "wbc", None)
+    get_pose = getattr(wbc, "get_pose", None)
+    if callable(get_pose):
+        for frame_name in frame_names:
+            try:
+                pose = np.asarray(get_pose(frame_name, env_idx), dtype=np.float64)
+                if pose.shape == (4, 4) and np.all(np.isfinite(pose)):
+                    return pose
+            except Exception:
+                pass
+
+    required_pose = getattr(term, "_required_wbc_pose_for_frame", None)
+    if callable(required_pose):
+        return np.asarray(required_pose(frame_names, env_idx, label), dtype=np.float64)
+
+    raise RuntimeError(
+        f"Could not read {label} pose from humanoid_wbc.getPose for env {env_idx}; "
+        f"tried frames={list(frame_names)}."
+    )
+
 
 def _assert_pose_slice_matches(
     action_batch_t: torch.Tensor,
@@ -356,6 +398,7 @@ def _assert_pose_slice_matches(
             f"expected={_format_tensor_row(expected_t)}."
         )
 
+
 def _assert_finite_slice(
     action_batch_t: torch.Tensor,
     env_idx: int,
@@ -365,6 +408,7 @@ def _assert_finite_slice(
     values = action_batch_t[env_idx, action_slice]
     if not bool(torch.isfinite(values).all()):
         raise RuntimeError(f"WBC action {label} slice contains non-finite values: {_format_tensor_row(values)}.")
+
 
 def _assert_rotation_slice_valid(
     action_batch_t: torch.Tensor,
@@ -385,6 +429,7 @@ def _assert_rotation_slice_valid(
             f"values={_format_tensor_row(values)} det={float(det):.6f}."
         )
 
+
 def _assert_target_position_slice(
     action_batch_t: torch.Tensor,
     env_idx: int,
@@ -397,6 +442,7 @@ def _assert_target_position_slice(
         _assert_finite_slice(action_batch_t, env_idx, label, action_slice)
         return
     _assert_pose_slice_matches(action_batch_t, env_idx, label, action_slice, expected, device)
+
 
 def _assert_target_rotation_slice(
     action_batch_t: torch.Tensor,
@@ -411,6 +457,7 @@ def _assert_target_rotation_slice(
         return
     _assert_pose_slice_matches(action_batch_t, env_idx, label, action_slice, expected, device)
 
+
 def _assert_foot_target_slices_valid(
     action_batch_t: torch.Tensor,
     env_idx: int,
@@ -423,11 +470,13 @@ def _assert_foot_target_slices_valid(
     _assert_rotation_slice_valid(action_batch_t, env_idx, f"{side}_foot_ori", ori_slice)
     _assert_finite_slice(action_batch_t, env_idx, f"{side}_foot_vel", vel_slice)
 
+
 def _integrated_target_value(term, attr_name: str, env_idx: int) -> np.ndarray | None:
     value = getattr(term, attr_name, None)
     if not isinstance(value, torch.Tensor) or env_idx >= value.shape[0]:
         return None
     return value[env_idx].detach().cpu().numpy()
+
 
 def _compute_batched_wbc_torques(env, term, actions: torch.Tensor, *, scale_actions: bool) -> torch.Tensor:
     policy_actions = actions if scale_actions else _task_actions_to_policy(actions, term)
@@ -441,6 +490,7 @@ def _compute_batched_wbc_torques(env, term, actions: torch.Tensor, *, scale_acti
         )
     return torques
 
+
 def _is_transition_state(term, state: int) -> bool:
     transition_names = (
         "DUAL_TO_LEFT_STANCE",
@@ -450,6 +500,7 @@ def _is_transition_state(term, state: int) -> bool:
     )
     return any(state == int(getattr(term.State, name)) for name in transition_names if hasattr(term.State, name))
 
+
 def _desired_state_matches_transition(term, desired_state: int, transition_state: int) -> bool:
     if not _is_transition_state(term, transition_state):
         return False
@@ -458,6 +509,7 @@ def _desired_state_matches_transition(term, desired_state: int, transition_state
     if not callable(next_state_fn):
         return desired_state == transition_state
     return desired_state == transition_state or desired_state == int(next_state_fn(transition_state))
+
 
 def _next_scalar_wbc_state(
     term,
@@ -479,6 +531,7 @@ def _next_scalar_wbc_state(
     if _desired_state_matches_transition(term, desired_state, achievable_state):
         return achievable_state
     return state
+
 
 def _wbc_targets_from_action(wbc_module, action_row: np.ndarray):
     action_row = np.asarray(action_row, dtype=np.float64).reshape(-1)
@@ -518,6 +571,7 @@ def _wbc_targets_from_action(wbc_module, action_row: np.ndarray):
         targets.left_foot.angular_velocity = action_row[63:66].copy()
     return targets
 
+
 def _single_wbc_state(term) -> int:
     cached_state = getattr(term, "_single_wbc_state", None)
     if cached_state is not None:
@@ -530,6 +584,7 @@ def _single_wbc_state(term) -> int:
         if len(states) > 0:
             return int(states[0])
     return int(term.State.DUAL_STANCE)
+
 
 def _single_wbc_transition_start_time(term) -> float:
     cached_time = getattr(term, "_single_wbc_transition_start_time", None)
@@ -544,6 +599,7 @@ def _single_wbc_transition_start_time(term) -> float:
             return float(transition_start_times[0])
     return 0.0
 
+
 def _sync_single_wbc_state(term, output_state: int, transition_start_time: float) -> None:
     cached_transition_start_time = 0.0 if not _is_transition_state(term, output_state) else transition_start_time
     setattr(term, "_single_wbc_state", int(output_state))
@@ -556,46 +612,6 @@ def _sync_single_wbc_state(term, output_state: int, transition_start_time: float
     reset_state = getattr(term.wbc, "reset_state", None)
     if callable(reset_state):
         reset_state(int(output_state), float(cached_transition_start_time), 0)
-
-
-def _force_wbc_dual_stance(term) -> None:
-    dual_state = int(term.State.DUAL_STANCE)
-    if hasattr(term, "curr_state"):
-        for env_idx in range(len(term.curr_state)):
-            term.curr_state[env_idx] = dual_state
-    if hasattr(term, "transition_start_time"):
-        for env_idx in range(len(term.transition_start_time)):
-            term.transition_start_time[env_idx] = 0.0
-
-    setattr(term, "_single_wbc_state", dual_state)
-    setattr(term, "_single_wbc_transition_start_time", 0.0)
-
-    reset_state = getattr(term.wbc, "reset_state", None)
-    if callable(reset_state):
-        reset_state(dual_state, 0.0)
-
-    phase_shift = getattr(term, "_wbc_phase_shift_frac", None)
-    target_phase_fn = getattr(term, "_startup_target_phase_for_states", None)
-    if isinstance(phase_shift, torch.Tensor) and callable(target_phase_fn):
-        desired_states = torch.full_like(phase_shift, dual_state, dtype=torch.long)
-        phase_shift[:] = target_phase_fn(desired_states).to(device=phase_shift.device, dtype=phase_shift.dtype)
-
-
-def _reinitialize_wbc_tasks(term) -> None:
-    if hasattr(term.wbc, "reInitializeAllTasks"):
-        term.wbc.reInitializeAllTasks()
-        return
-    debug_engine = getattr(term, "_wbc_debug_engine", None)
-    if debug_engine is not None and hasattr(debug_engine, "reInitializeAllTasks"):
-        debug_engine.reInitializeAllTasks()
-        return
-    raise RuntimeError("Invalid reinitialize")
-
-
-def _reset_wbc_targets_from_current_pose(term) -> None:
-    reset_targets = getattr(term, "_reset_wbc_integrated_targets", None)
-    if callable(reset_targets):
-        reset_targets()
 
 
 def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actions: bool) -> torch.Tensor:
@@ -621,8 +637,8 @@ def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actio
     left_contact_points = term._as_numpy_2d(env.simulator.left_foot_contact_position, "left_contact_points")
     right_contact_bases = term._contact_bases_as_numpy(env.simulator.right_foot_contact_basis, "right_contact_bases")
     left_contact_bases = term._contact_bases_as_numpy(env.simulator.left_foot_contact_basis, "left_contact_bases")
-    right_grfs = term._batched_local_foot_ground_reaction_wrenches("right")
-    left_grfs = term._batched_local_foot_ground_reaction_wrenches("left")
+    right_grfs = -term._batched_local_foot_ground_reaction_wrenches("right")
+    left_grfs = -term._batched_local_foot_ground_reaction_wrenches("left")
     right_in_contact = term._batched_foot_contact_in_contact("right", right_grfs)
     left_in_contact = term._batched_foot_contact_in_contact("left", left_grfs)
     term._last_wbc_right_grfs = right_grfs.copy()
@@ -642,6 +658,8 @@ def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actio
     if engine is None:
         raise RuntimeError("JointTorqueActionTerm did not expose _wbc_debug_engine for --wbc-command single.")
     engine.updateRobot(q[0], dq[0])
+
+    print("update robot")
 
     action_batch = term._actions_for_batched_wbc(
         policy_actions,
@@ -676,6 +694,8 @@ def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actio
     if not _is_transition_state(term, state) and in_transition:
         transition_start_time = float(env.simulator.time())
 
+    print("next state: ", next_state)
+
     engine.updateStanceSupport(
         next_state,
         right_contact_points[0],
@@ -696,12 +716,17 @@ def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actio
     output_state = int(output_state)
     _sync_single_wbc_state(term, output_state, transition_start_time)
 
+    print(torque_wbc)
+
     torque_np = term._actuated_torques_from_wbc_output(torque_wbc).reshape(1, -1)
+
+    print("torque np: ", torque_np)
 
     term._last_wbc_torque_output = torque_np.copy()
     torques = torch.as_tensor(torque_np, device=device, dtype=term.torques.dtype)
     _assert_wbc_action_layout_values(env, term, _expected_task_actions(actions, term, scale_actions=scale_actions))
     return torques
+
 
 def _compute_wbc_torques(env, term, actions: torch.Tensor, command: str, *, scale_actions: bool) -> torch.Tensor:
     if command == "batch":
@@ -710,14 +735,19 @@ def _compute_wbc_torques(env, term, actions: torch.Tensor, command: str, *, scal
         return _compute_single_wbc_torques(env, term, actions, scale_actions=scale_actions)
     raise ValueError(f"Unknown WBC command mode: {command}")
 
+
 def _task_actions_to_policy(actions: torch.Tensor, term) -> torch.Tensor:
     action_scales = term.action_scales.to(device=actions.device, dtype=actions.dtype)
     return actions / torch.clamp(action_scales, min=1.0e-12)
 
+
 def _apply_wbc_torques(env, term, actions: torch.Tensor, command: str, *, scale_actions: bool) -> None:
     term.torques[:] = _compute_wbc_torques(env, term, actions, command, scale_actions=scale_actions)
+    print("simulator torques: ")
+    print(term.torques[:])
     env.simulator.apply_torques_at_dof(term.torques)
     term._prev_dof_vel.copy_(env.simulator.dof_vel)
+
 
 def _wbc_action_batch_dim(term) -> int | None:
     action_batch = getattr(term, "_last_wbc_action_batch", None)
@@ -725,15 +755,18 @@ def _wbc_action_batch_dim(term) -> int | None:
         return None
     return int(action_batch.shape[1])
 
+
 def _assert_wbc_action_batch_dim_supported(action_batch) -> None:
     if action_batch.shape[1] not in (66, 72):
         raise RuntimeError(f"Expected a 66D or 72D batched WBC action row, got shape={action_batch.shape}.")
+
 
 def _expected_task_actions(actions: torch.Tensor, term, *, scale_actions: bool) -> torch.Tensor:
     if not scale_actions:
         return actions
     action_scales = term.action_scales.to(device=actions.device, dtype=actions.dtype)
     return actions * action_scales
+
 
 def _assert_wbc_action_layout_values(env, term, expected_task_actions: torch.Tensor) -> None:
     action_batch = getattr(term, "_last_wbc_action_batch", None)
@@ -860,6 +893,7 @@ def _assert_wbc_action_layout_values(env, term, expected_task_actions: torch.Ten
                 f"expected={_format_tensor_row(expected[0])}."
             )
 
+
 def _assert_required_wbc_bindings(term) -> None:
     wbc_module = getattr(term, "_wbc_module", None)
     if wbc_module is None:
@@ -872,6 +906,7 @@ def _assert_required_wbc_bindings(term) -> None:
     if not hasattr(swing_foot(), "resolveTrajectoryFromCurrentStateToPose"):
         raise RuntimeError("humanoid_wbc.SwingFoot is missing resolveTrajectoryFromCurrentStateToPose.")
 
+
 def _assert_action_layout_12d(env) -> None:
     if env.action_manager.total_action_dim != 12:
         raise RuntimeError(
@@ -880,17 +915,20 @@ def _assert_action_layout_12d(env) -> None:
             f"got action_dim={env.action_manager.total_action_dim}."
         )
 
+
 def _wbc_desired_state(term, env_idx: int = 0) -> int | None:
     desired_state = getattr(term, "_last_wbc_desired_state", None)
     if not isinstance(desired_state, torch.Tensor) or env_idx >= desired_state.shape[0]:
         return None
     return int(desired_state[env_idx].detach().cpu().item())
 
+
 def _wbc_bootstrap_hold(term, env_idx: int = 0) -> bool | None:
     hold_mask = getattr(term, "wbc_bootstrap_hold_mask", None)
     if not isinstance(hold_mask, torch.Tensor) or env_idx >= hold_mask.shape[0]:
         return None
     return bool(hold_mask[env_idx].detach().cpu().item())
+
 
 def _draw_com_markers(env, current_com: torch.Tensor, desired_com: torch.Tensor, radius: float) -> None:
     simulator = env.simulator
@@ -904,6 +942,7 @@ def _draw_com_markers(env, current_com: torch.Tensor, desired_com: torch.Tensor,
     desired_position = desired_com.detach().cpu()
     simulator.draw_sphere(current_position, radius, [0.1, 1.0, 0.25], env_id=0, pos_id=0)
     simulator.draw_sphere(desired_position, radius, [0.1, 0.8, 1.0], env_id=0, pos_id=1)
+
 
 def _build_hold_controller(config, simulator, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     target_q = _state_tensor(simulator.dof_pos).to(device=device, dtype=torch.float32).clone()
@@ -928,18 +967,6 @@ def _build_hold_controller(config, simulator, device: str) -> tuple[torch.Tensor
     ).unsqueeze(0)
     return target_q, kp.unsqueeze(0), kd.unsqueeze(0), torque_limits
 
-def _compute_hold_torques(
-    simulator,
-    target_q: torch.Tensor,
-    kp: torch.Tensor,
-    kd: torch.Tensor,
-    torque_limits: torch.Tensor,
-) -> torch.Tensor:
-    dof_pos = _state_tensor(simulator.dof_pos).to(device=target_q.device, dtype=target_q.dtype)
-    dof_vel = _state_tensor(simulator.dof_vel).to(device=target_q.device, dtype=target_q.dtype)
-    torques = kp * (target_q - dof_pos) - kd * dof_vel
-    return torch.clamp(torques, min=-torque_limits, max=torque_limits)
-
 
 def _apply_hold_torques(
     simulator,
@@ -947,10 +974,13 @@ def _apply_hold_torques(
     kp: torch.Tensor,
     kd: torch.Tensor,
     torque_limits: torch.Tensor,
-) -> torch.Tensor:
-    torques = _compute_hold_torques(simulator, target_q, kp, kd, torque_limits)
+) -> None:
+    dof_pos = _state_tensor(simulator.dof_pos).to(device=target_q.device, dtype=target_q.dtype)
+    dof_vel = _state_tensor(simulator.dof_vel).to(device=target_q.device, dtype=target_q.dtype)
+    torques = kp * (target_q - dof_pos) - kd * dof_vel
+    torques = torch.clamp(torques, min=-torque_limits, max=torque_limits)
     simulator.apply_torques_at_dof(torques)
-    return torques
+
 
 def _print_hold_summary(hold_step_idx: int, env, term) -> None:
     print(
@@ -962,6 +992,7 @@ def _print_hold_summary(hold_step_idx: int, env, term) -> None:
         f" left_count={_contact_count(env.simulator, 'left')}"
         f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
     )
+
 
 def _print_step_summary(control_step_idx: int, sim_step_idx: int, env, term) -> None:
     torques = term.torques[0]
@@ -987,12 +1018,14 @@ def _print_step_summary(control_step_idx: int, sim_step_idx: int, env, term) -> 
         f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
     )
 
+
 def _batch_state_at(term, env_idx: int):
     get_states = getattr(term.wbc, "get_states", None)
     if not callable(get_states):
         return None
     states = get_states()
     return states[env_idx] if env_idx < len(states) else None
+
 
 def _batch_transition_start_at(term, env_idx: int):
     get_times = getattr(term.wbc, "get_transition_start_times", None)
@@ -1003,13 +1036,14 @@ def _batch_transition_start_at(term, env_idx: int):
         return None
     return f"{float(transition_start_times[env_idx]):.6f}"
 
+
 def main() -> int:
     humanoid_control_root = REPO_ROOT.parent / "humanoid-control"
     default_extension_dir = humanoid_control_root / "build"
     default_holosoma_robot_file = REPO_ROOT / "src" / "holosoma" / "holosoma" / "data" / "robots" / "g1" / "g1_29dof.urdf"
     default_wbc_robot_file = _existing_default(
         humanoid_control_root / "models" / "unitree_g1" / "g1.urdf",
-        # default_holosoma_robot_file,
+        default_holosoma_robot_file,
     )
     default_yaml_file = humanoid_control_root / "params" / "g1_parameters.yaml"
 
@@ -1053,31 +1087,54 @@ def main() -> int:
     parser.add_argument("--disable-com-visualization", action="store_true", help="Do not draw the desired COM marker.")
     parser.add_argument("--com-marker-radius", type=float, default=0.025, help="COM marker radius in meters.")
     parser.add_argument(
-        "--action-amplitude",
+        "--linear-velocity-amplitude-xy",
         type=float,
-        nargs="+",
-        default=[0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.0, 0.0, 0.0, 0, 0, 0],
-        metavar="A",
-        help=(
-            "Sinusoidal action amplitude. Pass one value for all 12 action dimensions, or 12 values for "
-            "[pelvis_lin_vel, pelvis_ang_vel, com_vel, landing_foot_delta_xyyaw]."
-        ),
+        nargs=2,
+        default=(0.10, 0.04),
+        metavar=("X", "Y"),
+        help="Sinusoidal COM linear velocity amplitude in m/s for x y.",
     )
     parser.add_argument(
-        "--action-frequency",
+        "--linear-velocity-frequency-xy",
         type=float,
-        nargs="+",
-        default=[1.0],
-        metavar="HZ",
-        help="Sinusoidal action frequency in Hz. Pass one value for all dimensions, or 12 values.",
+        nargs=2,
+        default=(0.25, 0.25),
+        metavar=("X", "Y"),
+        help="Sinusoidal COM linear velocity frequency in Hz for x y.",
     )
     parser.add_argument(
-        "--action-phase",
+        "--linear-velocity-phase-xy",
         type=float,
-        nargs="+",
-        default=[0.0],
-        metavar="RAD",
-        help="Sinusoidal action phase in radians. Pass one value for all dimensions, or 12 values.",
+        nargs=2,
+        default=(0.0, math.pi / 2.0),
+        metavar=("X", "Y"),
+        help="Sinusoidal COM linear velocity phase in radians for x y.",
+    )
+    parser.add_argument(
+        "--pelvis-linear-velocity-amplitude-xyz",
+        type=float,
+        nargs=3,
+        default=(0.02, 0.02, 0.0),
+        metavar=("X", "Y", "Z"),
+        help="Sinusoidal pelvis linear velocity residual amplitude in m/s for x y z.",
+    )
+    parser.add_argument(
+        "--pelvis-angular-velocity-amplitude-xyz",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.15),
+        metavar=("X", "Y", "Z"),
+        help="Sinusoidal pelvis angular velocity residual amplitude in rad/s for x y z.",
+    )
+    parser.add_argument("--yaw-velocity-frequency", type=float, default=0.25, help="Sinusoidal pelvis yaw velocity frequency in Hz.")
+    parser.add_argument("--yaw-velocity-phase", type=float, default=0.0, help="Sinusoidal pelvis yaw velocity phase in radians.")
+    parser.add_argument(
+        "--landing-residual-amplitude",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("X", "Y", "YAW"),
+        help="Sinusoidal landing foot residual action amplitude for x y yaw.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generated test actions.")
     parser.add_argument(
@@ -1117,6 +1174,18 @@ def main() -> int:
         raise ValueError("--print-every must be a positive integer.")
     if args.com_marker_radius <= 0.0:
         raise ValueError("--com-marker-radius must be positive.")
+    if any(amplitude < 0.0 for amplitude in args.linear_velocity_amplitude_xy):
+        raise ValueError("--linear-velocity-amplitude-xy values must be non-negative.")
+    if any(frequency < 0.0 for frequency in args.linear_velocity_frequency_xy):
+        raise ValueError("--linear-velocity-frequency-xy values must be non-negative.")
+    if any(amplitude < 0.0 for amplitude in args.pelvis_linear_velocity_amplitude_xyz):
+        raise ValueError("--pelvis-linear-velocity-amplitude-xyz values must be non-negative.")
+    if any(amplitude < 0.0 for amplitude in args.pelvis_angular_velocity_amplitude_xyz):
+        raise ValueError("--pelvis-angular-velocity-amplitude-xyz values must be non-negative.")
+    if args.yaw_velocity_frequency < 0.0:
+        raise ValueError("--yaw-velocity-frequency must be non-negative.")
+    if any(amplitude < 0.0 for amplitude in args.landing_residual_amplitude):
+        raise ValueError("--landing-residual-amplitude values must be non-negative.")
     torch.manual_seed(args.seed)
 
     wbc_extension_dir = _resolve_path(args.wbc_extension_dir)
@@ -1146,29 +1215,17 @@ def main() -> int:
         _reset_without_physics_step(env)
         _zero_reset_velocities(env)
         term = env.action_manager.get_term("torque_control")
-        # _assert_action_layout_12d(env)
-        # _assert_required_wbc_bindings(term)
-
+        _assert_action_layout_12d(env)
+        _assert_required_wbc_bindings(term)
+    
         wbc_engine = getattr(term, "_wbc_debug_engine", term.wbc)
         wbc_dof = int(wbc_engine.dof())
-        action_amplitude = torch.tensor(
-            _expand_action_values(args.action_amplitude, env.action_manager.total_action_dim, "--action-amplitude"),
-            device=device,
-            dtype=torch.float32,
-        )
-        action_frequency = torch.tensor(
-            _expand_action_values(args.action_frequency, env.action_manager.total_action_dim, "--action-frequency"),
-            device=device,
-            dtype=torch.float32,
-        )
-        action_phase = torch.tensor(
-            _expand_action_values(args.action_phase, env.action_manager.total_action_dim, "--action-phase"),
-            device=device,
-            dtype=torch.float32,
-        )
-        if bool(torch.any(action_frequency < 0.0)):
-            raise ValueError("--action-frequency values must be non-negative.")
-
+        # if wbc_dof != env.num_dof:
+        #     raise RuntimeError(
+        #         f"WBC dof mismatch: env.num_dof={env.num_dof}, wbc.dof()={wbc_dof}. "
+        #         "Pass matching --robot-file/--yaml-file/--robot-name for G1."
+        #     )
+    
         right_count = _contact_count(env.simulator, "right")
         left_count = _contact_count(env.simulator, "left")
         print(
@@ -1187,8 +1244,11 @@ def main() -> int:
             f" left_contact={_format_tensor_row(env.simulator.left_foot_contact_position[0])}"
             f" left_grf={_format_tensor_row(_foot_grf(env, term, 'left'))}"
         )
-
+        # if right_count <= 0 or left_count <= 0:
+        #     raise RuntimeError("G1 did not start in dual-foot contact after reset_all().")
+    
         control_decimation = int(env.simulator.simulator_config.sim.control_decimation)
+        # control_decimation = 1
         control_steps = (args.sim_steps + control_decimation - 1) // control_decimation
         print(
             "run:"
@@ -1198,13 +1258,12 @@ def main() -> int:
             f" actual_sim_steps={args.sim_steps}"
             f" nominal_seconds={args.sim_steps / float(env.simulator.simulator_config.sim.fps):.3f}"
         )
-
+    
         hold_target_q, hold_kp, hold_kd, hold_torque_limits = _build_hold_controller(config, env.simulator, device)
         hold_step_idx = 0
-        last_hold_torques = _compute_hold_torques(env.simulator, hold_target_q, hold_kp, hold_kd, hold_torque_limits)
         while not _both_feet_in_contact(env.simulator) and hold_step_idx < args.contact_hold_max_steps:
             hold_step_idx += 1
-            last_hold_torques = _apply_hold_torques(env.simulator, hold_target_q, hold_kp, hold_kd, hold_torque_limits)
+            _apply_hold_torques(env.simulator, hold_target_q, hold_kp, hold_kd, hold_torque_limits)
             env.simulator.simulate_at_each_physics_step()
             env.simulator.refresh_sim_tensors()
             env.render()
@@ -1221,20 +1280,15 @@ def main() -> int:
             )
 
         print(
+            "switch_to_wbc:"
             f" hold_steps={hold_step_idx}"
             f" right_count={_contact_count(env.simulator, 'right')}"
             f" left_count={_contact_count(env.simulator, 'left')}"
         )
-        _zero_reset_velocities(env)
-        _explicitly_update_wbc_robot_state(env, term, args.wbc_command, device)
-        _force_wbc_dual_stance(term)
-        _reinitialize_wbc_tasks(term)
-        _reset_wbc_targets_from_current_pose(term)
-
+    
         actions = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=device, dtype=torch.float32)
         scale_actions = args.action_units == "policy"
-        _compute_wbc_torques(env, term, actions, args.wbc_command, scale_actions=scale_actions)
-        warmup_torques = last_hold_torques.to(device=term.torques.device, dtype=term.torques.dtype)
+        warmup_torques = _compute_wbc_torques(env, term, actions, args.wbc_command, scale_actions=scale_actions)
         if warmup_torques.shape != term.torques.shape:
             raise RuntimeError(
                 f"WBC torque shape mismatch: got {warmup_torques.shape}, expected {term.torques.shape}."
@@ -1242,23 +1296,48 @@ def main() -> int:
         if not bool(torch.isfinite(warmup_torques).all()):
             raise RuntimeError(f"{args.wbc_command} WBC warmup produced non-finite torques.")
         term.torques[:] = warmup_torques
+        if hasattr(term.wbc, "reInitializeAllTasks"):
+            term.wbc.reInitializeAllTasks()
+        else:
+            debug_engine = getattr(term, "_wbc_debug_engine", None)
+            if debug_engine is not None and hasattr(debug_engine, "reInitializeAllTasks"):
+                debug_engine.reInitializeAllTasks()
         print(
             "wbc_warmup:"
             f" command={args.wbc_command}"
             f" desired_state={_wbc_desired_state(term)}"
             f" bootstrap_hold={_wbc_bootstrap_hold(term)}"
             f" action_batch_dim={_wbc_action_batch_dim(term)}"
-            # f" torque_norm={float(torch.linalg.vector_norm(warmup_torques[0]).item()):.6f}"
-            # f" torque_max={float(torch.max(torch.abs(warmup_torques[0])).item()):.6f}"
+            f" torque_norm={float(torch.linalg.vector_norm(warmup_torques[0]).item()):.6f}"
+            f" torque_max={float(torch.max(torch.abs(warmup_torques[0])).item()):.6f}"
         )
-        # raise RuntimeError(f"lala")
 
+        linear_velocity_amplitude = torch.tensor(args.linear_velocity_amplitude_xy, device=device, dtype=torch.float32)
+        linear_velocity_frequency = torch.tensor(args.linear_velocity_frequency_xy, device=device, dtype=torch.float32)
+        linear_velocity_phase = torch.tensor(args.linear_velocity_phase_xy, device=device, dtype=torch.float32)
+        pelvis_linear_velocity_amplitude = torch.tensor(
+            args.pelvis_linear_velocity_amplitude_xyz, device=device, dtype=torch.float32
+        )
+        pelvis_angular_velocity_amplitude = torch.tensor(
+            args.pelvis_angular_velocity_amplitude_xyz, device=device, dtype=torch.float32
+        )
+        landing_residual_amplitude = torch.tensor(args.landing_residual_amplitude, device=device, dtype=torch.float32)
         control_step_idx = 0
         for sim_step_idx in range(1, args.sim_steps + 1):
             if (sim_step_idx - 1) % control_decimation == 0:
                 control_step_idx += 1
                 sim_time = float(env.simulator.time())
-                actions[:] = action_amplitude * torch.sin(2.0 * torch.pi * action_frequency * sim_time + action_phase)
+                actions.zero_()
+                # actions[:, 0:3] = pelvis_linear_velocity_amplitude * math.sin(
+                #     2.0 * math.pi * args.yaw_velocity_frequency * sim_time + args.yaw_velocity_phase
+                # )
+                # actions[:, 3:6] = pelvis_angular_velocity_amplitude * math.sin(
+                #     2.0 * math.pi * args.yaw_velocity_frequency * sim_time + args.yaw_velocity_phase
+                # )
+                # actions[:, 6:8] = linear_velocity_amplitude * torch.sin(
+                #     2.0 * math.pi * linear_velocity_frequency * sim_time + linear_velocity_phase
+                # )
+                # actions[:, 9:12] = landing_residual_amplitude * math.sin(2.0 * math.pi * sim_time)
                 _explicitly_update_wbc_robot_state(env, term, args.wbc_command, device)
                 if not args.disable_com_visualization:
                     current_com = _current_com_position(wbc_engine, device)
@@ -1271,7 +1350,6 @@ def main() -> int:
                 # Do not also call env.action_manager.process_actions(actions), because that
                 # can rescale/cache delayed actions and then this script may convert them again.
 
-            _force_wbc_dual_stance(term)
             _apply_wbc_torques(env, term, actions, args.wbc_command, scale_actions=scale_actions)
             _assert_wbc_action_layout_values(
                 env,
@@ -1281,11 +1359,11 @@ def main() -> int:
             env.simulator.simulate_at_each_physics_step()
             env.simulator.refresh_sim_tensors()
             env.render()
-
+    
             should_print = sim_step_idx % control_decimation == 0 or sim_step_idx == args.sim_steps
             if should_print and control_step_idx % args.print_every == 0:
                 _print_step_summary(control_step_idx, sim_step_idx, env, term)
-
+    
         print(
             "final:"
             f" state={term.curr_state[0] if hasattr(term, 'curr_state') else None}"
@@ -1307,6 +1385,7 @@ def main() -> int:
         if hasattr(env, "close"):
             env.close()
         close_simulation_app(simulation_app)
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -61,6 +61,13 @@ class MeshType(str, Enum):
 class SpawnCfg:
     """Configuration for robot spawning behavior."""
 
+    zero_origin: bool = False
+    """Spawn all environments at world origin instead of terrain tile origins.
+
+    Useful for single-environment visual/debug runs where large terrain-grid
+    coordinates make inspection awkward.
+    """
+
     randomize_tiles: bool = True
     """Randomize terrain tile selection for curriculum learning.
     When True, robots spawn at random tiles across the terrain grid.

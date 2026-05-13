@@ -609,6 +609,9 @@ class IsaacGym(BaseSimulator):
         self._rigid_body_rot = self._rigid_body_state_reshaped[..., : self.num_bodies, 3:7]
         self._rigid_body_vel = self._rigid_body_state_reshaped[..., : self.num_bodies, 7:10]
         self._rigid_body_ang_vel = self._rigid_body_state_reshaped[..., : self.num_bodies, 10:13]
+        self.com_pos = self._rigid_body_pos.mean(dim=1)
+        self.com_lin_vel = self._rigid_body_vel.mean(dim=1)
+        self.com_vel = self.com_lin_vel
 
         # DOF forces
         _dof_forces = self.gym.acquire_dof_force_tensor(self.sim)
@@ -651,6 +654,10 @@ class IsaacGym(BaseSimulator):
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        if hasattr(self, "_rigid_body_pos"):
+            self.com_pos = self._rigid_body_pos.mean(dim=1)
+            self.com_lin_vel = self._rigid_body_vel.mean(dim=1)
+            self.com_vel = self.com_lin_vel
 
         self.gym.refresh_force_sensor_tensor(self.sim)
         self.gym.refresh_dof_force_tensor(self.sim)

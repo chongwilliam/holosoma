@@ -11,8 +11,7 @@ from holosoma.config_types.robot import (
 g1_29dof = RobotConfig(
     num_bodies=32,
     dof_obs_size=29,
-    # actions_dim=29,
-    actions_dim=21,
+    actions_dim=29,
     policy_obs_dim=-1,
     critic_obs_dim=-1,
     algo_obs_dim_dict={},
@@ -524,7 +523,7 @@ g1_29dof = RobotConfig(
             "wrist_pitch": 1.068141502,  # DAMPING_4010
             "wrist_yaw": 1.068141502,  # DAMPING_4010
         },
-        action_scale=0.25,  # 0.25 for locomotion, 1.0 for whole body tracking
+        action_scale=0.25,
         action_clip_value=100.0,
         clip_actions=True,
         clip_torques=True,
@@ -552,6 +551,16 @@ g1_29dof = RobotConfig(
     bridge=RobotBridgeConfig(
         sdk_type="unitree",
         motor_type="serial",
+    ),
+)
+
+G1_29DOF_DUAL_STANCE_ROOT_POS = [0.0, 0.0, 0.793]
+
+g1_29dof_dual_stance = replace(
+    g1_29dof,
+    init_state=replace(
+        g1_29dof.init_state,
+        pos=G1_29DOF_DUAL_STANCE_ROOT_POS,
     ),
 )
 
@@ -1112,6 +1121,7 @@ g1_29dof_w_object = replace(
 
 DEFAULTS = {
     "g1_29dof": g1_29dof,
+    "g1_29dof_dual_stance": g1_29dof_dual_stance,
     "t1_29dof_waist_wrist": t1_29dof_waist_wrist,
     "g1_29dof_w_object": g1_29dof_w_object,
 }

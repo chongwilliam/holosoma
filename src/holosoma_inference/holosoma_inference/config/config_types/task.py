@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic.dataclasses import dataclass
 
 
@@ -15,8 +17,29 @@ class TaskConfig:
     rl_rate: float = 50
     """Policy inference rate in Hz."""
 
-    policy_action_scale: float = 0.25
-    """Scaling factor applied to policy actions."""
+    policy_action_scale: float | tuple[float, ...] = 0.25
+    """Scaling factor(s) applied to policy actions."""
+
+    policy_action_space: Literal["joint_position", "task_space"] = "joint_position"
+    """How to interpret policy actions during command post-processing."""
+
+    wbc_state_port: int = 5556
+    """ZMQ port used to receive simulator state needed for task-space WBC."""
+
+    wbc_extension_dir: str | None = None
+    """Directory containing the humanoid_wbc extension module."""
+
+    wbc_robot_file: str | None = None
+    """Robot URDF path passed to the WBC controller."""
+
+    wbc_yaml_file: str | None = None
+    """WBC parameter YAML path."""
+
+    wbc_robot_name: str = "g1"
+    """Robot name passed to the WBC controller."""
+
+    wbc_contact_force_threshold: float = 20.0
+    """Minimum local foot force norm treated as contact by the WBC."""
 
     use_phase: bool = True
     """Whether to use gait phase observations."""

@@ -15,6 +15,7 @@ from holosoma.managers.observation.terms.locomotion import (
     get_projected_gravity,
     gravity_vector,
 )
+from holosoma.managers.reward.base import RewardTermBase
 from holosoma.utils.rotations import (
     quat_apply,
     quat_rotate_batched,
@@ -107,6 +108,56 @@ def penalty_feet_ori(env: LeggedRobotLocomotionManager) -> torch.Tensor:
         torch.sum(torch.square(left_gravity[:, :2]), dim=1) ** 0.5
         + torch.sum(torch.square(right_gravity[:, :2]), dim=1) ** 0.5
     )
+
+
+class PenaltyContactStateSwitching(RewardTermBase):
+    """Penalize changes in left/right foot contact state between reward checks."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._previous_contact_state = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+        self._steps_since_switch = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        if env_ids is None:
+            self._previous_contact_state.fill_(-1)
+            self._steps_since_switch.zero_()
+        else:
+            self._previous_contact_state[env_ids] = -1
+            self._steps_since_switch[env_ids] = 0
+
+    def __call__(
+        self,
+        env,
+        right_contact_count_attr: str = "right_foot_contact_count",
+        left_contact_count_attr: str = "left_foot_contact_count",
+        penalty_per_changed_foot: bool = False,
+        min_steps_between_switches: int = 1,
+    ) -> torch.Tensor:
+        if min_steps_between_switches < 1:
+            raise ValueError("min_steps_between_switches must be at least 1.")
+
+        right_counts = getattr(env.simulator, right_contact_count_attr)
+        left_counts = getattr(env.simulator, left_contact_count_attr)
+        right_contact = right_counts.to(device=env.device, dtype=torch.long).reshape(-1) > 0
+        left_contact = left_counts.to(device=env.device, dtype=torch.long).reshape(-1) > 0
+
+        contact_state = right_contact.to(torch.long) + 2 * left_contact.to(torch.long)
+        initialized = self._previous_contact_state >= 0
+        switched = initialized & (contact_state != self._previous_contact_state)
+        rapid_switch = switched & (self._steps_since_switch < min_steps_between_switches)
+
+        if penalty_per_changed_foot:
+            changed_feet = torch.bitwise_xor(contact_state, torch.clamp_min(self._previous_contact_state, 0))
+            penalty = ((changed_feet & 1) + ((changed_feet >> 1) & 1)).to(torch.float32)
+            penalty = torch.where(rapid_switch, penalty, torch.zeros_like(penalty))
+        else:
+            penalty = rapid_switch.to(torch.float32)
+
+        self._previous_contact_state[:] = contact_state
+        self._steps_since_switch += 1
+        self._steps_since_switch[switched] = 0
+        return penalty
 
 
 # ================================================================================================
@@ -248,6 +299,22 @@ def base_height(
         )
 
     return base_height_penalty
+
+
+def penalty_com_height(env, reference_com_height: float = 0.8, terrain_relative: bool = True) -> torch.Tensor:
+    """Penalize center-of-mass height away from a reference height."""
+    com_pos = getattr(env.simulator, "com_pos", None)
+    if not isinstance(com_pos, torch.Tensor) or com_pos.shape != (env.num_envs, 3):
+        com_pos = env.simulator.robot_root_states[:, 0:3]
+    com_pos = com_pos.to(device=env.device, dtype=torch.float32)
+
+    com_height = com_pos[:, 2]
+    if terrain_relative:
+        terrain_state = env.terrain_manager.get_state("locomotion_terrain")
+        terrain_height = env.simulator.robot_root_states[:, 2] - terrain_state.base_heights
+        com_height = com_height - terrain_height
+
+    return torch.square(com_height - reference_com_height)
 
 
 def feet_phase(env, swing_height: float = 0.08, tracking_sigma: float = 0.25) -> torch.Tensor:

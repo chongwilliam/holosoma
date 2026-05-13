@@ -582,6 +582,42 @@ def randomize_dof_state(
     )
 
 
+def reset_robot_to_init_state(
+    env,
+    env_ids,
+    *,
+    enabled: bool = True,
+    reset_root: bool = True,
+    reset_dofs: bool = True,
+    **_,
+) -> None:
+    """Restore the configured root state and default joint pose at the end of reset randomization."""
+    if not enabled:
+        return
+
+    idx = _ensure_env_ids_tensor(env, env_ids)
+    if idx.numel() == 0:
+        return
+
+    if reset_root:
+        root_states = env.base_init_state.unsqueeze(0).repeat(idx.shape[0], 1).to(
+            device=env.device,
+            dtype=env.simulator.robot_root_states.dtype,
+        )
+        terrain_manager = getattr(env, "terrain_manager", None)
+        if terrain_manager is not None:
+            terrain_state = terrain_manager.get_state("locomotion_terrain")
+            root_states[:, :3] += terrain_state.env_origins[idx].to(root_states.dtype)
+        env.simulator.robot_root_states[idx] = root_states
+
+    if reset_dofs:
+        env.simulator.dof_pos[idx] = env.default_dof_pos[idx]
+        env.simulator.dof_vel[idx] = 0.0
+
+    if hasattr(env, "need_to_refresh_envs"):
+        env.need_to_refresh_envs[idx] = True
+
+
 @mujoco_required_field("body_ipos")
 def randomize_base_com_startup(
     env,
