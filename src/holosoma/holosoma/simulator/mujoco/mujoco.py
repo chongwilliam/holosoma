@@ -1051,6 +1051,7 @@ class MuJoCo(BaseSimulator):
         raw_position = raw_position.to(device=self.sim_device, dtype=torch.float32)
         raw_basis = raw_basis.to(device=self.sim_device, dtype=torch.float32)
         foot_center = foot_center.to(device=self.sim_device, dtype=torch.float32)
+        self._write_raw_foot_contact_summary(side, env_idx, raw_position, raw_basis, raw_count)
 
         if raw_count <= 0:
             filtered_position = foot_center
@@ -1102,6 +1103,23 @@ class MuJoCo(BaseSimulator):
 
         self._foot_contact_filtered_basis[env_idx, side_idx] = filtered_basis
         self._write_foot_contact_summary(side, env_idx, filtered_position, filtered_basis, 1)
+
+    def _write_raw_foot_contact_summary(
+        self,
+        side: str,
+        env_idx: int,
+        position: torch.Tensor,
+        basis: torch.Tensor,
+        count: int,
+    ) -> None:
+        if side == "right":
+            self.right_foot_raw_contact_position[env_idx, :] = position
+            self.right_foot_raw_contact_basis[env_idx, :] = basis
+            self.right_foot_raw_contact_count[env_idx] = count
+        else:
+            self.left_foot_raw_contact_position[env_idx, :] = position
+            self.left_foot_raw_contact_basis[env_idx, :] = basis
+            self.left_foot_raw_contact_count[env_idx] = count
 
     def _write_foot_contact_summary(
         self,

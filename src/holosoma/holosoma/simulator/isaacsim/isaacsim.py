@@ -886,10 +886,16 @@ class IsaacSim(BaseSimulator):
                     self.right_foot_contact_position[env_id, :] = barycenter
                     self.right_foot_contact_basis[env_id, :] = support_axes
                     self.right_foot_contact_count[env_id] = valid_points_w.shape[0]
+                    self.right_foot_raw_contact_position[env_id, :] = barycenter
+                    self.right_foot_raw_contact_basis[env_id, :] = support_axes
+                    self.right_foot_raw_contact_count[env_id] = valid_points_w.shape[0]
                 else:
                     self.left_foot_contact_position[env_id, :] = barycenter
                     self.left_foot_contact_basis[env_id, :] = support_axes
                     self.left_foot_contact_count[env_id] = valid_points_w.shape[0]
+                    self.left_foot_raw_contact_position[env_id, :] = barycenter
+                    self.left_foot_raw_contact_basis[env_id, :] = support_axes
+                    self.left_foot_raw_contact_count[env_id] = valid_points_w.shape[0]
 
         self._rigid_body_pos = self._robot.data.body_pos_w[:, self.body_ids, :]
         self._rigid_body_rot = self._robot.data.body_quat_w[:, self.body_ids][

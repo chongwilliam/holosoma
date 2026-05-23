@@ -2,12 +2,11 @@
 
 from holosoma.config_types.action import ActionManagerCfg, ActionTermCfg
 
-G1_WBC_TASK_SPACE_ACTION_DIM = 12
+G1_WBC_TASK_SPACE_ACTION_DIM = 9
 G1_WBC_TASK_SPACE_ACTION_SCALE = [
-    0.1, 0.1, 0.05,  # pelvis linear velocity residual: vx, vy, vz
-    0.001, 0.001, 0.001,  # pelvis angular velocity residual: wx, wy, wz
-    0.1, 0.1, 0.05,  # COM velocity residual: vx, vy, vz
-    0.1, 0.1, 0.05,  # landing foot residual: dx, dy, dyaw
+    0.25, 0.20, 0.05,  # COM velocity residual: vx, vy, vz
+    0.15, 0.15, 0.25,  # pelvis angular velocity residual: wx, wy, wz
+    0.06, 0.04, 0.10,  # landing foot residual: dx, dy, dyaw
 ]
 G1_WBC_TASK_SPACE_ACTION_CLIP = [1.0] * G1_WBC_TASK_SPACE_ACTION_DIM
 
@@ -32,14 +31,19 @@ g1_29dof_torque = ActionManagerCfg(
                 "dual_stance_contact_required_steps": 10,
                 "startup_gait_timeout_s": 0.75,
                 "wbc_transition_time": 0.15,
-                "visualize_contact_points": False,
-                "visualize_contact_frames": False,
+                "filter_stance_support_contacts": False,
+                "use_unfiltered_stance_support_contacts": False,
+                "visualize_contact_points": True,
+                "visualize_contact_frames": True,
                 "visualize_action_targets": False,
                 "visualize_action_target_frames": False,
-                "visualize_landing_foot_pose": False,
-                "visualize_swing_foot_trajectory": False,
+                "visualize_landing_foot_pose": True,
+                "visualize_swing_foot_trajectory": True,
                 "swing_trajectory_samples": 12,
+                "swing_foot_midpoint_height": 0.2,
                 "landing_ground_plane_z": 0.0,
+                "use_command_as_pelvis_velocity_action": False,
+                "use_command_as_landing_velocity": False,
                 "assert_contact_visualization_pose": False,
                 "contact_point_radius": 0.018,
                 "action_target_radius": 0.026,

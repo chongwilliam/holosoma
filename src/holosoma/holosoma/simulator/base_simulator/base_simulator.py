@@ -122,6 +122,12 @@ class BaseSimulator:
     left_foot_contact_position: torch.Tensor  # (num_envs, 3): contact barycenter in foot frame
     right_foot_contact_count: torch.Tensor  # (num_envs,)
     left_foot_contact_count: torch.Tensor  # (num_envs,)
+    right_foot_raw_contact_basis: torch.Tensor  # (num_envs, 3): unfiltered [roll, pitch, yaw] support
+    left_foot_raw_contact_basis: torch.Tensor  # (num_envs, 3): unfiltered [roll, pitch, yaw] support
+    right_foot_raw_contact_position: torch.Tensor  # (num_envs, 3): unfiltered contact barycenter in foot frame
+    left_foot_raw_contact_position: torch.Tensor  # (num_envs, 3): unfiltered contact barycenter in foot frame
+    right_foot_raw_contact_count: torch.Tensor  # (num_envs,)
+    left_foot_raw_contact_count: torch.Tensor  # (num_envs,)
     contact_forces: torch.Tensor
     contact_forces_history: torch.Tensor
     scene: SceneInterface
@@ -199,6 +205,12 @@ class BaseSimulator:
         self.left_foot_contact_position = torch.zeros_like(self.right_foot_contact_position)
         self.right_foot_contact_count = torch.zeros(self.num_envs, device=self.sim_device, dtype=torch.long)
         self.left_foot_contact_count = torch.zeros_like(self.right_foot_contact_count)
+        self.right_foot_raw_contact_basis = torch.zeros_like(self.right_foot_contact_basis)
+        self.left_foot_raw_contact_basis = torch.zeros_like(self.left_foot_contact_basis)
+        self.right_foot_raw_contact_position = torch.zeros_like(self.right_foot_contact_position)
+        self.left_foot_raw_contact_position = torch.zeros_like(self.left_foot_contact_position)
+        self.right_foot_raw_contact_count = torch.zeros_like(self.right_foot_contact_count)
+        self.left_foot_raw_contact_count = torch.zeros_like(self.left_foot_contact_count)
         self._foot_contact_filter_initialized = torch.zeros(
             self.num_envs, 2, device=self.sim_device, dtype=torch.bool
         )
@@ -219,6 +231,12 @@ class BaseSimulator:
         self.left_foot_contact_position.zero_()
         self.right_foot_contact_count.zero_()
         self.left_foot_contact_count.zero_()
+        self.right_foot_raw_contact_basis.zero_()
+        self.left_foot_raw_contact_basis.zero_()
+        self.right_foot_raw_contact_position.zero_()
+        self.left_foot_raw_contact_position.zero_()
+        self.right_foot_raw_contact_count.zero_()
+        self.left_foot_raw_contact_count.zero_()
 
     def get_local_foot_force_sensor_wrench(self, side: str, env_id: int = 0) -> torch.Tensor:
         """Return foot force-torque sensor data expressed in the sensor-local frame."""

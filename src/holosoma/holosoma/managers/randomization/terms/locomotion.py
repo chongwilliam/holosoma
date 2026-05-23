@@ -600,9 +600,15 @@ def reset_robot_to_init_state(
         return
 
     if reset_root:
+        root_state_dtype = env.base_init_state.dtype
+        root_state_view = env.simulator.robot_root_states
+        try:
+            root_state_dtype = root_state_view[idx].dtype
+        except AttributeError:
+            pass
         root_states = env.base_init_state.unsqueeze(0).repeat(idx.shape[0], 1).to(
             device=env.device,
-            dtype=env.simulator.robot_root_states.dtype,
+            dtype=root_state_dtype,
         )
         terrain_manager = getattr(env, "terrain_manager", None)
         if terrain_manager is not None:

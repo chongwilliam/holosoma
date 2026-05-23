@@ -88,8 +88,13 @@ class _BatchedWbcFacade:
         else:
             self._controller.reset_state(state, transition_start_time, int(env_id))
 
-    def compute_torques_batch(self, *args: Any, **kwargs: Any) -> Any:
-        return self._controller.compute_torques_batch(*args, **kwargs)
+    def compute_torques_batch(self, q: Any, dq: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return self._controller.compute_torques_batch(q, dq, *args, **kwargs)
+        except TypeError as exc:
+            if "compute_torques_batch()" not in str(exc):
+                raise
+            return self._controller.compute_torques_batch(*args, **kwargs)
 
     def update_robot(self, q: Any, dq: Any) -> None:
         self._controller.update_robot(q, dq)
@@ -119,7 +124,7 @@ class _BatchedWbcFacade:
 
 
 class TaskSpaceWbcTorqueComputer:
-    """Compute actuated torques from 12D locomotion task-space policy actions."""
+    """Compute actuated torques from 9D locomotion task-space policy actions."""
 
     def __init__(self, task_config: TaskConfig, num_dofs: int):
         self.task_config = task_config
@@ -156,17 +161,17 @@ class TaskSpaceWbcTorqueComputer:
             )
 
         raw_action = np.asarray(scaled_task_action, dtype=np.float64).reshape(1, -1)
-        if raw_action.shape[1] != 12:
-            raise ValueError(f"Task-space WBC expects a 12D action, got shape {raw_action.shape}.")
+        if raw_action.shape[1] != 9:
+            raise ValueError(f"Task-space WBC expects a 9D action, got shape {raw_action.shape}.")
         action_scale = np.asarray(self.task_config.policy_action_scale, dtype=np.float64)
         if action_scale.ndim == 0:
-            action_scale = np.full((12,), float(action_scale), dtype=np.float64)
-        if action_scale.shape != (12,):
+            action_scale = np.full((9,), float(action_scale), dtype=np.float64)
+        if action_scale.shape != (9,):
             raise ValueError(
-                "task.policy_action_scale must be scalar or length-12 for task-space WBC inference. "
+                "task.policy_action_scale must be scalar or length-9 for task-space WBC inference. "
                 f"Got shape {action_scale.shape}."
             )
-        action = raw_action * action_scale.reshape(1, 12)
+        action = raw_action * action_scale.reshape(1, 9)
 
         root_state = np.asarray(state["root_state"], dtype=np.float64).reshape(13)
         dof_pos = np.asarray(state["dof_pos"], dtype=np.float64).reshape(self.num_dofs)
@@ -193,7 +198,7 @@ class TaskSpaceWbcTorqueComputer:
 
         self.wbc.update_robot(q, dq)
         desired_states = self._desired_states_from_phase(phase)
-        wbc_action = self._wbc_action_from_12d(action, desired_states, lin_vel_command, ang_vel_command)
+        wbc_action = self._wbc_action_from_9d(action, desired_states, lin_vel_command, ang_vel_command)
         torque_wbc = self.wbc.compute_torques_batch(
             q,
             dq,
@@ -238,28 +243,27 @@ class TaskSpaceWbcTorqueComputer:
             state = int(self.State.LEFT_STANCE)
         return np.ascontiguousarray(np.array([state], dtype=np.int32))
 
-    def _wbc_action_from_12d(
+    def _wbc_action_from_9d(
         self,
         action: np.ndarray,
         desired_states: np.ndarray,
         lin_vel_command: np.ndarray | None,
         ang_vel_command: np.ndarray | None,
     ) -> np.ndarray:
-        pelvis_lin_vel_residual = action[0, 0:3]
+        com_vel_residual = action[0, 0:3]
         pelvis_ang_vel_residual = action[0, 3:6]
-        com_vel_residual = action[0, 6:9]
-        landing_residual = action[0, 9:12]
-        nominal_pelvis_lin_vel, nominal_pelvis_ang_vel = self._nominal_pelvis_velocities(
+        landing_residual = action[0, 6:9]
+        _nominal_pelvis_lin_vel, nominal_pelvis_ang_vel = self._nominal_pelvis_velocities(
             lin_vel_command,
             ang_vel_command,
         )
 
         right_pose = self._pose_or_contact("right_foot", "right")
         left_pose = self._pose_or_contact("left_foot", "left")
-        wbc_action = np.zeros((1, 72), dtype=np.float64)
-        wbc_action[0, 3:6] = com_vel_residual
-        wbc_action[0, 18:21] = nominal_pelvis_lin_vel + pelvis_lin_vel_residual
-        wbc_action[0, 21:24] = nominal_pelvis_ang_vel + pelvis_ang_vel_residual
+        wbc_action = np.zeros((1, 45), dtype=np.float64)
+        wbc_action[0, 0:3] = com_vel_residual
+        wbc_action[0, 3:6] = nominal_pelvis_ang_vel + pelvis_ang_vel_residual
+        wbc_action[0, 6:9] = nominal_pelvis_ang_vel + pelvis_ang_vel_residual
         self._write_foot_target(wbc_action, "right", right_pose[:3, 3], right_pose[:3, :3], np.zeros(6))
         self._write_foot_target(wbc_action, "left", left_pose[:3, 3], left_pose[:3, :3], np.zeros(6))
 
@@ -332,9 +336,9 @@ class TaskSpaceWbcTorqueComputer:
         velocity: np.ndarray,
     ) -> None:
         if side == "right":
-            pos_slice, ori_slice, vel_slice = slice(36, 39), slice(39, 48), slice(48, 54)
+            pos_slice, ori_slice, vel_slice = slice(9, 12), slice(12, 21), slice(21, 27)
         elif side == "left":
-            pos_slice, ori_slice, vel_slice = slice(54, 57), slice(57, 66), slice(66, 72)
+            pos_slice, ori_slice, vel_slice = slice(27, 30), slice(30, 39), slice(39, 45)
         else:
             raise ValueError(f"Unknown foot side {side!r}.")
         wbc_action[0, pos_slice] = np.asarray(position, dtype=np.float64).reshape(3)

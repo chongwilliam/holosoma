@@ -105,14 +105,13 @@ def root_states_to_xyz_rpy(root_states: torch.Tensor) -> torch.Tensor:
 
 def parse_actions(actions: torch.Tensor) -> dict[str, torch.Tensor]:
     """Convert the policy task-space action into named slices."""
-    if actions.shape[-1] != 12:
-        raise ValueError(f"Expected exactly 12 task-space action values, got shape {tuple(actions.shape)}.")
+    if actions.shape[-1] != 9:
+        raise ValueError(f"Expected exactly 9 task-space action values, got shape {tuple(actions.shape)}.")
 
     action_dict = {
-        "pelvis_lin_vel": actions[..., :3],  # (vx, vy, vz) residual pelvis linear velocity
+        "com_vel": actions[..., :3],  # (vx, vy, vz) residual com velocity
         "pelvis_ang_vel": actions[..., 3:6],  # (wx, wy, wz) residual pelvis angular velocity
-        "com_vel": actions[..., 6:9],  # (vx, vy, vz) residual COM velocity
-        "landing_foot_delta_pose": actions[..., 9:12], # (x, y, theta) residual (relative to the stance foot pose)
+        "landing_foot_delta_pose": actions[..., 6:9], # (x, y, theta) residual (relative to the stance foot pose)
     }
 
     return action_dict
@@ -519,11 +518,11 @@ class _BatchedWbcFacade:
 
     def compute_torques_batch(self, q: Any, dq: Any, *args: Any, **kwargs: Any) -> Any:
         try:
-            return self._controller.compute_torques_batch(*args, **kwargs)
+            return self._controller.compute_torques_batch(q, dq, *args, **kwargs)
         except TypeError as exc:
             if "compute_torques_batch()" not in str(exc):
                 raise
-            return self._controller.compute_torques_batch(q, dq, *args, **kwargs)
+            return self._controller.compute_torques_batch(*args, **kwargs)
 
     def update_robot(self, q: Any, dq: Any) -> None:
         self._controller.update_robot(q, dq)
@@ -580,6 +579,7 @@ class _BatchedSwingFootPlanner:
         dt: float,
         takeoff_clearance: float = 0.05,
         landing_clearance: float = 0.05,
+        midpoint_height: float | None = 0.2,
     ):
         if not hasattr(wbc_module, "SwingFoot") or not hasattr(wbc_module, "Contact"):
             raise RuntimeError(
@@ -599,6 +599,15 @@ class _BatchedSwingFootPlanner:
         self._dt = float(dt)
         self._takeoff_clearance = float(takeoff_clearance)
         self._landing_clearance = float(landing_clearance)
+        self._midpoint_height = None if midpoint_height is None else float(midpoint_height)
+        if self._midpoint_height is not None and self._planners and not hasattr(self._planners[0], "setMidpointHeight"):
+            raise RuntimeError(
+                "humanoid_wbc.SwingFoot must provide setMidpointHeight(height) for configurable swing-foot apex height. "
+                "Rebuild humanoid-control so the Python extension includes the midpoint-height binding."
+            )
+        for planner in self._planners:
+            if self._midpoint_height is not None:
+                planner.setMidpointHeight(self._midpoint_height)
         self._active_sides: list[str | None] = [None for _ in range(num_envs)]
 
     def reset(self, env_ids: list[int] | range) -> None:
@@ -710,10 +719,10 @@ class JointTorqueActionTerm(ActionTermBase):
         # Policy actions may be task-space commands, while the controller still outputs
         # one torque per actuated DOF.
         self._action_dim = env.robot_config.actions_dim
-        if self._action_dim != 12:
+        if self._action_dim != 9:
             raise ValueError(
-                "JointTorqueActionTerm expects the 12-D policy action layout "
-                "[pelvis_lin_vel(3), pelvis_ang_vel(3), com_vel(3), landing_foot_delta_xyyaw(3)]. "
+                "JointTorqueActionTerm expects the 9-D policy action layout "
+                "[com_vel(3), pelvis_ang_vel(3), landing_foot_delta_xyyaw(3)]. "
                 f"Got robot_config.actions_dim={self._action_dim}."
             )
         self._torque_dim = env.num_dof
@@ -801,6 +810,10 @@ class JointTorqueActionTerm(ActionTermBase):
         self._startup_gait_timeout_s = float(cfg.params.get("startup_gait_timeout_s", 0.75))
         self._wbc_dt = float(cfg.params.get("wbc_control_dt", getattr(env.simulator, "sim_dt", env.dt)))
         self._startup_gait_timeout_steps = max(1, int(math.ceil(self._startup_gait_timeout_s / self._wbc_dt)))
+        filter_stance_support_contacts = not bool(cfg.params.get("use_unfiltered_stance_support_contacts", False))
+        self._filter_stance_support_contacts = bool(
+            cfg.params.get("filter_stance_support_contacts", filter_stance_support_contacts)
+        )
         self._visualize_contact_points = bool(
             cfg.params.get("visualize_contact_points", False)
             or cfg.params.get("visualize_wbc_contact_points", False)
@@ -830,6 +843,8 @@ class JointTorqueActionTerm(ActionTermBase):
         )
         self._swing_trajectory_samples = int(cfg.params.get("swing_trajectory_samples", 12))
         self._landing_ground_plane_z = float(cfg.params.get("landing_ground_plane_z", 0.05))
+        self._use_command_as_pelvis_velocity_action = bool(cfg.params.get("use_command_as_pelvis_velocity_action", False))
+        self._use_command_as_landing_velocity = bool(cfg.params.get("use_command_as_landing_velocity", False))
         self._store_wbc_debug_snapshots = bool(
             cfg.params.get("store_wbc_debug_snapshots", False)
             or os.environ.get("HOLOSOMA_STORE_WBC_DEBUG_SNAPSHOTS", "0") == "1"
@@ -857,6 +872,9 @@ class JointTorqueActionTerm(ActionTermBase):
         self._assert_contact_visualization_pose = bool(cfg.params.get("assert_contact_visualization_pose", False))  # debug assert
         self._swing_foot_takeoff_clearance = float(cfg.params.get("swing_foot_takeoff_clearance", 0.05))
         self._swing_foot_landing_clearance = float(cfg.params.get("swing_foot_landing_clearance", 0.05))
+        self._swing_foot_midpoint_height = cfg.params.get("swing_foot_midpoint_height", 0.2)
+        if self._swing_foot_midpoint_height is not None:
+            self._swing_foot_midpoint_height = float(self._swing_foot_midpoint_height)
         self._wbc_transition_time = float(cfg.params.get("wbc_transition_time", 0.15))
         self._wbc_bootstrap_done = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         self._dual_contact_counter = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -1045,10 +1063,9 @@ class JointTorqueActionTerm(ActionTermBase):
         self._last_wbc_root_state[:num_envs] = root_states
         self._last_wbc_dof_pos[:num_envs] = dof_pos
 
-        right_contact_points = self._as_numpy_2d(self.env.simulator.right_foot_contact_position, "right_contact_points")
-        left_contact_points = self._as_numpy_2d(self.env.simulator.left_foot_contact_position, "left_contact_points")
-        right_contact_bases = self._contact_bases_as_numpy(self.env.simulator.right_foot_contact_basis, "right_contact_bases")
-        left_contact_bases = self._contact_bases_as_numpy(self.env.simulator.left_foot_contact_basis, "left_contact_bases")
+        right_contact_points, left_contact_points, right_contact_bases, left_contact_bases = (
+            self._stance_support_contact_arrays()
+        )
         # right_grfs = self._batched_foot_ground_reaction_wrenches("right")
         # left_grfs = self._batched_foot_ground_reaction_wrenches("left")
         right_grfs = - self._batched_local_foot_ground_reaction_wrenches("right") # local grf
@@ -1067,6 +1084,11 @@ class JointTorqueActionTerm(ActionTermBase):
         self.wbc.update_robot(q, dq)
         sin_phase, cos_phase = self._phase_features_for_wbc(actions)
         desired_states, swing_sides, remaining_swing_durations = self._desired_states_from_phase(sin_phase, cos_phase)
+        desired_states, swing_sides, remaining_swing_durations = self._maybe_force_wbc_desired_state(
+            desired_states,
+            swing_sides,
+            remaining_swing_durations,
+        )
 
         self._last_wbc_sin_phase[:num_envs] = sin_phase
         self._last_wbc_cos_phase[:num_envs] = cos_phase
@@ -1096,6 +1118,11 @@ class JointTorqueActionTerm(ActionTermBase):
             if bool(startup_started.any()):
                 desired_states, swing_sides, remaining_swing_durations = self._desired_states_from_phase(
                     sin_phase, cos_phase
+                )
+                desired_states, swing_sides, remaining_swing_durations = self._maybe_force_wbc_desired_state(
+                    desired_states,
+                    swing_sides,
+                    remaining_swing_durations,
                 )
                 self._last_wbc_desired_state[:num_envs] = torch.as_tensor(
                     desired_states, device=self.env.device, dtype=torch.long
@@ -1534,20 +1561,21 @@ class JointTorqueActionTerm(ActionTermBase):
     @staticmethod
     def _wbc_action_slices() -> tuple[tuple[str, slice], ...]:
         return (
-            ("com_pos", slice(0, 3)),
+            ("com_rel_pos", slice(0, 3)),
             ("com_vel", slice(3, 6)),
-            ("pelvis_pos", slice(6, 9)),
-            ("pelvis_ori", slice(9, 18)),
-            ("pelvis_lin_vel", slice(18, 21)),
-            ("pelvis_ang_vel", slice(21, 24)),
-            ("torso_ori", slice(24, 33)),
-            ("torso_ang_vel", slice(33, 36)),
-            ("right_foot_pos", slice(36, 39)),
-            ("right_foot_ori", slice(39, 48)),
-            ("right_foot_vel", slice(48, 54)),
-            ("left_foot_pos", slice(54, 57)),
-            ("left_foot_ori", slice(57, 66)),
-            ("left_foot_vel", slice(66, 72)),
+            ("pelvis_rel_pos", slice(6, 9)),
+            ("pelvis_rel_ori", slice(9, 12)),
+            ("pelvis_lin_vel", slice(12, 15)),
+            ("pelvis_ang_vel", slice(15, 18)),
+            ("torso_rel_ori", slice(18, 21)),
+            ("torso_ang_vel", slice(21, 24)),
+            ("right_foot_pos", slice(24, 27)),
+            ("right_foot_ori", slice(27, 36)),
+            ("right_foot_vel", slice(36, 42)),
+            ("left_foot_pos", slice(42, 45)),
+            ("left_foot_ori", slice(45, 54)),
+            ("left_foot_vel", slice(54, 60)),
+            ("unused", slice(60, 72)),
         )
 
     def _wbc_action_slice_summary(self, action_batch: np.ndarray | None, env_idx: int) -> str:
@@ -1761,8 +1789,9 @@ class JointTorqueActionTerm(ActionTermBase):
             action_scales = action_scales.to(device=actions.device, dtype=actions.dtype)
         scaled_actions = actions * action_scales
         self._assert_finite_torch_debug("wbc_scaled_actions", scaled_actions)
-        if scaled_actions.shape[-1] != 12:
-            raise ValueError(f"Expected 12-D policy actions for WBC expansion, got shape {tuple(scaled_actions.shape)}.")
+        if scaled_actions.shape[-1] != 9:
+            raise ValueError(f"Expected 9-D policy actions for WBC expansion, got shape {tuple(scaled_actions.shape)}.")
+        scaled_actions = self._with_commanded_pelvis_velocity_action(scaled_actions)
 
         if desired_states is None or swing_sides is None or remaining_swing_durations is None:
             sin_phase, cos_phase = self._phase_features_for_wbc(actions)
@@ -1776,6 +1805,36 @@ class JointTorqueActionTerm(ActionTermBase):
         )
         self._assert_finite_numpy_debug("wbc_expanded_actions", wbc_actions)
         return np.ascontiguousarray(wbc_actions)
+
+    def _with_commanded_pelvis_velocity_action(self, actions: torch.Tensor) -> torch.Tensor:
+        if not self._use_command_as_pelvis_velocity_action:
+            return actions
+
+        command_manager = getattr(self.env, "command_manager", None)
+        commands = getattr(command_manager, "commands", None)
+        if commands is None:
+            return actions
+
+        command_tensor = self._as_torch_tensor(
+            commands,
+            device=actions.device,
+            dtype=actions.dtype,
+            label="locomotion_commands",
+        )
+        if command_tensor.ndim != 2 or command_tensor.shape[0] < actions.shape[0] or command_tensor.shape[1] < 3:
+            return actions
+
+        commanded = command_tensor[: actions.shape[0], :3]
+        if not torch.isfinite(commanded).all():
+            return actions
+
+        updated_actions = actions.clone()
+        updated_actions[:, 0:3] = 0.0
+        updated_actions[:, 0:2] = commanded[:, 0:2]
+        updated_actions[:, 3:6] = 0.0
+        updated_actions[:, 5] = commanded[:, 2]
+        self._assert_finite_torch_debug("wbc_commanded_pelvis_velocity_actions", updated_actions)
+        return updated_actions
 
     def _actions_to_wbc_targets(
         self,
@@ -1793,33 +1852,29 @@ class JointTorqueActionTerm(ActionTermBase):
         }
 
         self._integrate_wbc_motion_targets(actions)
-        integrated_com_pos = self._wbc_integrated_com_pos[:num_envs].detach().cpu().numpy().astype(np.float64, copy=False)
-        integrated_pelvis_pos = (
-            self._wbc_integrated_pelvis_pos[:num_envs].detach().cpu().numpy().astype(np.float64, copy=False)
-        )
-        integrated_pelvis_rot = (
-            self._wbc_integrated_pelvis_rot[:num_envs].detach().cpu().numpy().astype(np.float64, copy=False)
-        )
-        integrated_torso_rot = (
-            self._wbc_integrated_torso_rot[:num_envs].detach().cpu().numpy().astype(np.float64, copy=False)
-        )
-
         # Batched WBC target layout:
-        # com pos/lin vel(3/3),
-        # pelvis pos/ori/lin vel/ang vel(3/9/3/3),
-        # torso ori/ang vel(9/3),
+        # com relative pos / lin vel(3/3),
+        # pelvis relative pos / relative ori / lin vel / ang vel(3/3/3/3),
+        # torso relative ori / ang vel(3/3),
         # right foot pos/ori/vel(3/9/6),
         # left foot pos/ori/vel(3/9/6).
+        # The binding currently selects this layout with action_dim == 72 but consumes
+        # only the first 60 values; keep the trailing 12 entries as zeros.
         wbc_actions = np.zeros((num_envs, 72), dtype=np.float64)
-        wbc_actions[:, 0:3] = integrated_com_pos
+        wbc_actions[:, 0:3] = self._wbc_integrated_com_pos[:num_envs].detach().cpu().numpy().astype(
+            np.float64, copy=False
+        )
         wbc_actions[:, 3:6] = action_np["com_vel"]
-        wbc_actions[:, 6:9] = integrated_pelvis_pos
-        wbc_actions[:, 9:18] = integrated_pelvis_rot.reshape(num_envs, 9)
-        wbc_actions[:, 18:21] = action_np["pelvis_lin_vel"]
-        wbc_actions[:, 21:24] = action_np["pelvis_ang_vel"]
-        wbc_actions[:, 24:33] = integrated_torso_rot.reshape(num_envs, 9)
-        wbc_actions[:, 33:36] = action_np["pelvis_ang_vel"]  # match with the pelvis for now
-
+        wbc_actions[:, 6:9] = self._wbc_integrated_pelvis_pos[:num_envs].detach().cpu().numpy().astype(
+            np.float64, copy=False
+        )
+        pelvis_rot = self._wbc_integrated_pelvis_rot[:num_envs].detach().cpu().numpy()
+        torso_rot = self._wbc_integrated_torso_rot[:num_envs].detach().cpu().numpy()
+        wbc_actions[:, 9:12] = np.stack([matrix_to_axis_angle(rotation) for rotation in pelvis_rot], axis=0)
+        wbc_actions[:, 12:15] = action_np["com_vel"]
+        wbc_actions[:, 15:18] = action_np["pelvis_ang_vel"]
+        wbc_actions[:, 18:21] = np.stack([matrix_to_axis_angle(rotation) for rotation in torso_rot], axis=0)
+        wbc_actions[:, 21:24] = action_np["pelvis_ang_vel"]  # match with the pelvis for now
 
         current_poses = self._batched_foot_pose_matrices()
         current_linear_velocities = self._batched_foot_linear_velocities()
@@ -2108,6 +2163,8 @@ class JointTorqueActionTerm(ActionTermBase):
             ],
             axis=1,
         ).astype(np.float64, copy=False)
+        if not self._use_command_as_landing_velocity:
+            return fallback
 
         command_manager = getattr(self.env, "command_manager", None)
         commands = getattr(command_manager, "commands", None)
@@ -2179,18 +2236,20 @@ class JointTorqueActionTerm(ActionTermBase):
 
     def _integrate_wbc_motion_targets(self, actions: torch.Tensor) -> None:
         dt = self._wbc_dt
-        self._wbc_integrated_com_pos[: actions.shape[0], :2] += actions[:, 6:8].to(
+        action_dict = parse_actions(actions)
+        integrated_com_velocity = action_dict["com_vel"].to(
             device=self.env.device, dtype=self._wbc_integrated_com_pos.dtype
-        ) * dt
-        self._wbc_integrated_pelvis_pos[: actions.shape[0]] += actions[:, :3].to(
-            device=self.env.device, dtype=self._wbc_integrated_pelvis_pos.dtype
+        )
+        self._wbc_integrated_com_pos[: actions.shape[0]] += integrated_com_velocity * dt
+        self._wbc_integrated_pelvis_pos[: actions.shape[0]] += integrated_com_velocity.to(
+            dtype=self._wbc_integrated_pelvis_pos.dtype
         ) * dt
 
-        yaw_delta = actions[:, 5].detach().cpu().numpy().astype(float, copy=False) * dt
-        for env_idx, delta in enumerate(yaw_delta[: actions.shape[0]]):
-            if abs(float(delta)) < 1.0e-12:
+        angular_delta = action_dict["pelvis_ang_vel"].detach().cpu().numpy().astype(float, copy=False) * dt
+        for env_idx, delta in enumerate(angular_delta[: actions.shape[0]]):
+            if np.linalg.norm(delta) < 1.0e-12:
                 continue
-            delta_rot = yaw_to_matrix3d(float(delta))
+            delta_rot = exp_map(np.asarray(delta, dtype=float).reshape(3))
             pelvis_rot = self._wbc_integrated_pelvis_rot[env_idx].detach().cpu().numpy()
             torso_rot = self._wbc_integrated_torso_rot[env_idx].detach().cpu().numpy()
             self._wbc_integrated_pelvis_rot[env_idx] = torch.as_tensor(
@@ -2205,71 +2264,32 @@ class JointTorqueActionTerm(ActionTermBase):
             )
 
     def _reset_wbc_integrated_targets(self, env_ids: torch.Tensor | None = None) -> None:
-        root_states = self._as_torch_tensor(
-            self.env.simulator.robot_root_states,
-            device=self.env.device,
-            dtype=torch.float32,
-            label="integrated_target_root_states",
-        )
-        self._update_wbc_robot_from_simulator()
-        root_rot = quaternion_to_matrix(root_states[:, 3:7], w_last=True)
-        com_pos = getattr(self.env.simulator, "com_pos", None)
-        if isinstance(com_pos, torch.Tensor) and com_pos.ndim == 2 and com_pos.shape[0] >= self.env.num_envs:
-            current_com_pos = com_pos.to(device=self.env.device, dtype=self._wbc_integrated_com_pos.dtype)
-        else:
-            current_com_pos = root_states[:, :3].to(dtype=self._wbc_integrated_com_pos.dtype)
-
         if env_ids is None:
-            env_id_list = list(range(self.env.num_envs))
             env_index = torch.arange(self.env.num_envs, device=self.env.device)
         elif env_ids.dtype == torch.bool:
             env_index = env_ids.nonzero(as_tuple=False).flatten()
-            env_id_list = [int(env_idx) for env_idx in env_index.detach().cpu().tolist()]
         else:
             env_index = env_ids.flatten().to(device=self.env.device, dtype=torch.long)
-            env_id_list = [int(env_idx) for env_idx in env_index.detach().cpu().tolist()]
 
         if env_index.numel() == 0:
             return
 
-        self._wbc_integrated_com_pos[env_index] = current_com_pos[env_index]
-        self._wbc_integrated_pelvis_pos[env_index] = root_states[:, :3][env_index].to(
-            dtype=self._wbc_integrated_pelvis_pos.dtype
-        )
-        self._wbc_integrated_pelvis_rot[env_index] = root_rot[env_index].to(dtype=self._wbc_integrated_pelvis_rot.dtype)
-        self._wbc_integrated_torso_rot[env_index] = root_rot[env_index].to(dtype=self._wbc_integrated_torso_rot.dtype)
-        for env_idx in env_id_list:
-            com_pose = self._required_wbc_pose_for_frame(("com",), env_idx, "COM")
-            self._wbc_integrated_com_pos[env_idx] = torch.as_tensor(
-                com_pose[:3, 3],
-                device=self.env.device,
-                dtype=self._wbc_integrated_com_pos.dtype,
-            )
-
-            pelvis_pose = self._required_wbc_pose_for_frame(("pelvis",), env_idx, "pelvis")
-            self._wbc_integrated_pelvis_pos[env_idx] = torch.as_tensor(
-                pelvis_pose[:3, 3],
-                device=self.env.device,
-                dtype=self._wbc_integrated_pelvis_pos.dtype,
-            )
-            self._wbc_integrated_pelvis_rot[env_idx] = torch.as_tensor(
-                pelvis_pose[:3, :3],
-                device=self.env.device,
-                dtype=self._wbc_integrated_pelvis_rot.dtype,
-            )
-
-            torso_pose = self._required_wbc_pose_for_frame(("torso", "torso_link"), env_idx, "torso")
-            torso_rot = torso_pose[:3, :3]
-            self._wbc_integrated_torso_rot[env_idx] = torch.as_tensor(
-                torso_rot,
-                device=self.env.device,
-                dtype=self._wbc_integrated_torso_rot.dtype,
-            )
+        self._wbc_integrated_com_pos[env_index] = 0.0
+        self._wbc_integrated_pelvis_pos[env_index] = 0.0
+        identity = torch.eye(3, device=self.env.device, dtype=self._wbc_integrated_pelvis_rot.dtype)
+        identity_batch = identity.unsqueeze(0).expand(env_index.numel(), -1, -1)
+        self._wbc_integrated_pelvis_rot[env_index] = identity_batch
+        self._wbc_integrated_torso_rot[env_index] = identity_batch.to(dtype=self._wbc_integrated_torso_rot.dtype)
 
     def _fill_absolute_foot_targets(self, wbc_actions: np.ndarray, current_poses: dict[str, np.ndarray]) -> None:
+        fixed_poses = getattr(self, "_fixed_wbc_foot_target_poses", None)
         for side in ("right", "left"):
             for env_idx in range(wbc_actions.shape[0]):
                 pose = current_poses[side][env_idx]
+                if isinstance(fixed_poses, dict) and side in fixed_poses:
+                    side_poses = fixed_poses[side]
+                    if env_idx < side_poses.shape[0]:
+                        pose = side_poses[env_idx]
                 self._write_absolute_foot_target(
                     wbc_actions,
                     env_idx,
@@ -2289,13 +2309,13 @@ class JointTorqueActionTerm(ActionTermBase):
         velocity: np.ndarray,
     ) -> None:
         if side == "right":
-            pos_slice = slice(36, 39)
-            ori_slice = slice(39, 48)
-            vel_slice = slice(48, 54)
+            pos_slice = slice(24, 27)
+            ori_slice = slice(27, 36)
+            vel_slice = slice(36, 42)
         elif side == "left":
-            pos_slice = slice(54, 57)
-            ori_slice = slice(57, 66)
-            vel_slice = slice(66, 72)
+            pos_slice = slice(42, 45)
+            ori_slice = slice(45, 54)
+            vel_slice = slice(54, 60)
         else:
             raise ValueError(f"Unknown foot side {side!r}.")
 
@@ -2406,6 +2426,31 @@ class JointTorqueActionTerm(ActionTermBase):
                 remaining[env_idx] = max((1.0 - phase + left_end) * env_cycle_time, self._wbc_dt)
 
         return desired_states, swing_sides, remaining.astype(np.float64, copy=False)
+
+    def _maybe_force_wbc_desired_state(
+        self,
+        desired_states: np.ndarray,
+        swing_sides: list[str | None],
+        remaining_swing_durations: np.ndarray,
+    ) -> tuple[np.ndarray, list[str | None], np.ndarray]:
+        forced_state = getattr(self, "_forced_wbc_desired_state", None)
+        if forced_state is None:
+            return desired_states, swing_sides, remaining_swing_durations
+
+        forced_state = int(forced_state)
+        desired_states = np.full_like(desired_states, forced_state)
+        remaining_swing_durations = np.full_like(remaining_swing_durations, self._wbc_dt, dtype=np.float64)
+
+        if forced_state == int(self.State.DUAL_STANCE):
+            swing_sides = [None for _ in swing_sides]
+        elif forced_state == int(self.State.LEFT_STANCE):
+            swing_sides = ["right" for _ in swing_sides]
+        elif forced_state == int(self.State.RIGHT_STANCE):
+            swing_sides = ["left" for _ in swing_sides]
+        else:
+            raise ValueError(f"Unsupported forced WBC desired state: {forced_state}.")
+
+        return desired_states, swing_sides, remaining_swing_durations
 
     def _gait_cycle_times(self, device: torch.device | str, dtype: torch.dtype) -> torch.Tensor:
         gait_state = self.env.command_manager.get_state("locomotion_gait")
@@ -2573,6 +2618,32 @@ class JointTorqueActionTerm(ActionTermBase):
             raise RuntimeError(f"{label} must have shape [num_envs, 3] or [num_envs, 3, 3], got {tuple(tensor.shape)}.")
         return np.ascontiguousarray(tensor.cpu().numpy().astype(np.float64, copy=False))
 
+    def _stance_support_contact_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        simulator = self.env.simulator
+        prefix = "" if self._filter_stance_support_contacts else "raw_"
+        right_position_attr = f"right_foot_{prefix}contact_position"
+        left_position_attr = f"left_foot_{prefix}contact_position"
+        right_basis_attr = f"right_foot_{prefix}contact_basis"
+        left_basis_attr = f"left_foot_{prefix}contact_basis"
+
+        if not self._filter_stance_support_contacts:
+            missing = [
+                attr
+                for attr in (right_position_attr, left_position_attr, right_basis_attr, left_basis_attr)
+                if not hasattr(simulator, attr)
+            ]
+            if missing:
+                right_position_attr = "right_foot_contact_position"
+                left_position_attr = "left_foot_contact_position"
+                right_basis_attr = "right_foot_contact_basis"
+                left_basis_attr = "left_foot_contact_basis"
+
+        right_contact_points = self._as_numpy_2d(getattr(simulator, right_position_attr), right_position_attr)
+        left_contact_points = self._as_numpy_2d(getattr(simulator, left_position_attr), left_position_attr)
+        right_contact_bases = self._contact_bases_as_numpy(getattr(simulator, right_basis_attr), right_basis_attr)
+        left_contact_bases = self._contact_bases_as_numpy(getattr(simulator, left_basis_attr), left_basis_attr)
+        return right_contact_points, left_contact_points, right_contact_bases, left_contact_bases
+
     def _batched_foot_ground_reaction_wrenches(self, side: str) -> np.ndarray:
         grfs = np.stack(
             [self._foot_ground_reaction_wrench(env_idx, side) for env_idx in range(self.env.num_envs)],
@@ -2633,28 +2704,13 @@ class JointTorqueActionTerm(ActionTermBase):
             self._draw_action_targets_for_env(env_idx, root_states[env_idx], action_batch[env_idx])
 
     def _draw_action_targets_for_env(self, env_idx: int, root_state: torch.Tensor, action_row: np.ndarray) -> None:
-        simulator = self.env.simulator
         action_row = np.asarray(action_row, dtype=float).reshape(-1)
         if action_row.shape[0] < 72:
             return
 
-        com_target = action_row[:3]
-        self._draw_target_pose(env_idx, com_target, None, [1.0, 0.15, 1.0], 300)
-
-        pelvis_target_pos = action_row[6:9]
-        pelvis_target_rot = action_row[9:18].reshape(3, 3)
-        self._draw_target_pose(env_idx, pelvis_target_pos, pelvis_target_rot, [0.95, 0.2, 1.0], 310)
-
-        torso_pose = self._wbc_pose_for_frame("torso", env_idx)
-        if torso_pose is None:
-            torso_pose = self._wbc_pose_for_frame("torso_link", env_idx)
-        if torso_pose is not None:
-            torso_target_rot = action_row[24:33].reshape(3, 3)
-            self._draw_target_pose(env_idx, torso_pose[:3, 3], torso_target_rot, [0.2, 1.0, 0.85], 320)
-
         for side, pos_slice, ori_slice, color, pos_id_base in (
-            ("right", slice(36, 39), slice(39, 48), [1.0, 0.35, 0.05], 330),
-            ("left", slice(54, 57), slice(57, 66), [0.25, 0.45, 1.0], 340),
+            ("right", slice(24, 27), slice(27, 36), [1.0, 0.35, 0.05], 330),
+            ("left", slice(42, 45), slice(45, 54), [0.25, 0.45, 1.0], 340),
         ):
             foot_target_pos = action_row[pos_slice]
             foot_target_rot = action_row[ori_slice].reshape(3, 3)
@@ -2743,7 +2799,8 @@ class JointTorqueActionTerm(ActionTermBase):
         samples = max(int(self._swing_trajectory_samples), 2)
         start = np.asarray(current_pose[:3, 3], dtype=float)
         end = np.asarray(landing_pose[:3, 3], dtype=float)
-        clearance = max(float(self._swing_foot_takeoff_clearance), float(self._swing_foot_landing_clearance))
+        fallback_clearance = max(float(self._swing_foot_takeoff_clearance), float(self._swing_foot_landing_clearance))
+        midpoint_height = self._swing_foot_midpoint_height
         color = [1.0, 0.55, 0.05] if swing_side == "right" else [0.1, 0.7, 1.0]
         pos_id_base = 400 if swing_side == "right" else 440
 
@@ -2751,7 +2808,8 @@ class JointTorqueActionTerm(ActionTermBase):
         for sample_idx in range(samples + 1):
             phase = sample_idx / float(samples)
             point_np = (1.0 - phase) * start + phase * end
-            point_np[2] += clearance * math.sin(math.pi * phase)
+            apex_z = float(midpoint_height) if midpoint_height is not None else end[2] + fallback_clearance
+            point_np[2] += max(0.0, apex_z - point_np[2]) * math.sin(math.pi * phase)
             if not np.all(np.isfinite(point_np)):
                 continue
 
@@ -3475,23 +3533,20 @@ class JointTorqueActionTerm(ActionTermBase):
 
     def _import_wbc_module(self, extension_dir: str | None = None):
         module_name = "humanoid_wbc"
+        self._try_add_local_extension_path(module_name, extension_dir)
         try:
             return importlib.import_module(module_name)
-        except Exception:
-            self._try_add_local_extension_path(module_name, extension_dir)
-            try:
-                return importlib.import_module(module_name)
-            except Exception as fallback_error:
-                candidates = self._find_wbc_extension_candidates(module_name, extension_dir)
-                supported_suffixes = importlib.machinery.EXTENSION_SUFFIXES
-                candidate_text = ", ".join(str(candidate) for candidate in candidates) or "none"
-                raise ModuleNotFoundError(
-                    "Could not import humanoid_wbc. "
-                    f"Searched extension_dir={extension_dir!r}; found candidates: {candidate_text}. "
-                    f"This Python accepts extension suffixes: {supported_suffixes}. "
-                    "If a candidate is tagged for another Python version, rebuild humanoid-control "
-                    "inside the active Python environment."
-                ) from fallback_error
+        except Exception as fallback_error:
+            candidates = self._find_wbc_extension_candidates(module_name, extension_dir)
+            supported_suffixes = importlib.machinery.EXTENSION_SUFFIXES
+            candidate_text = ", ".join(str(candidate) for candidate in candidates) or "none"
+            raise ModuleNotFoundError(
+                "Could not import humanoid_wbc. "
+                f"Searched extension_dir={extension_dir!r}; found candidates: {candidate_text}. "
+                f"This Python accepts extension suffixes: {supported_suffixes}. "
+                "If a candidate is tagged for another Python version, rebuild humanoid-control "
+                "inside the active Python environment."
+            ) from fallback_error
 
     def _resolve_wbc_asset_paths(
         self, extension_dir: str | None, params: dict[str, Any]
@@ -3535,6 +3590,7 @@ class JointTorqueActionTerm(ActionTermBase):
             dt=self._wbc_dt,
             takeoff_clearance=self._swing_foot_takeoff_clearance,
             landing_clearance=self._swing_foot_landing_clearance,
+            midpoint_height=self._swing_foot_midpoint_height,
         )
 
     def _create_wbc_engine(self, extension_dir: str | None, params: dict[str, Any], wbc_module: Any | None = None):

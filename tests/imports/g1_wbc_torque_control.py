@@ -28,7 +28,7 @@ from holosoma.config_values import simulator as simulator_defaults
 from holosoma.config_values import terrain as terrain_defaults
 from holosoma.config_values.loco.g1 import action as g1_loco_action
 from holosoma.config_values.loco.g1 import experiment as g1_loco_experiment
-from holosoma.managers.action.terms.torque_control import root_states_to_xyz_rpy
+from holosoma.managers.action.terms.torque_control import axis_angle_to_matrix, matrix_to_axis_angle, root_states_to_xyz_rpy
 from holosoma.utils.safe_torch_import import torch
 from holosoma.utils.sim_utils import close_simulation_app, setup_simulation_environment
 
@@ -57,6 +57,7 @@ def _build_action_cfg(wbc_extension_dir: str, robot_file: str, yaml_file: str, r
                     "yaml_file": yaml_file,
                     "robot_name": robot_name,
                     "store_wbc_debug_snapshots": True,
+                    "use_command_as_pelvis_velocity_action": False,
                     "visualize_contact_points": True,
                     "visualize_contact_frames": True,
                     "contact_point_radius": 0.025,
@@ -241,10 +242,14 @@ def _current_wbc_state_arrays(env, term, device: str) -> tuple[np.ndarray, np.nd
     return q, dq
 
 def _current_stance_support_inputs(env, term, env_idx: int = 0) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, bool, bool]:
-    right_contact_points = term._as_numpy_2d(env.simulator.right_foot_contact_position, "explicit_right_contact_points")
-    left_contact_points = term._as_numpy_2d(env.simulator.left_foot_contact_position, "explicit_left_contact_points")
-    right_contact_bases = term._contact_bases_as_numpy(env.simulator.right_foot_contact_basis, "explicit_right_contact_bases")
-    left_contact_bases = term._contact_bases_as_numpy(env.simulator.left_foot_contact_basis, "explicit_left_contact_bases")
+    contact_arrays = getattr(term, "_stance_support_contact_arrays", None)
+    if callable(contact_arrays):
+        right_contact_points, left_contact_points, right_contact_bases, left_contact_bases = contact_arrays()
+    else:
+        right_contact_points = term._as_numpy_2d(env.simulator.right_foot_contact_position, "explicit_right_contact_points")
+        left_contact_points = term._as_numpy_2d(env.simulator.left_foot_contact_position, "explicit_left_contact_points")
+        right_contact_bases = term._contact_bases_as_numpy(env.simulator.right_foot_contact_basis, "explicit_right_contact_bases")
+        left_contact_bases = term._contact_bases_as_numpy(env.simulator.left_foot_contact_basis, "explicit_left_contact_bases")
     right_grfs = -term._batched_local_foot_ground_reaction_wrenches("right")
     left_grfs = -term._batched_local_foot_ground_reaction_wrenches("left")
     right_in_contact = term._batched_foot_contact_in_contact("right", right_grfs)
@@ -480,42 +485,32 @@ def _next_scalar_wbc_state(
         return achievable_state
     return state
 
-def _wbc_targets_from_action(wbc_module, action_row: np.ndarray):
+def _wbc_targets_from_action(wbc_module, engine, action_row: np.ndarray):
     action_row = np.asarray(action_row, dtype=np.float64).reshape(-1)
-    if action_row.shape[0] not in (66, 72):
-        raise RuntimeError(f"Expected a 66D or 72D WBC action row, got shape={action_row.shape}.")
+    if action_row.shape[0] != 72:
+        raise RuntimeError(f"Expected a 72D WBC action row, got shape={action_row.shape}.")
+
+    com_pose = np.asarray(engine.getPose("com"), dtype=np.float64).reshape(4, 4)
+    pelvis_pose = np.asarray(engine.getPose("pelvis"), dtype=np.float64).reshape(4, 4)
+    torso_pose = np.asarray(engine.getPose("torso"), dtype=np.float64).reshape(4, 4)
 
     targets = wbc_module.WbcDesiredTargets()
-    targets.com.position = action_row[0:3].copy()
+    targets.com.position = com_pose[:3, 3] + action_row[0:3]
     targets.com.linear_velocity = action_row[3:6].copy()
-    if action_row.shape[0] == 72:
-        targets.pelvis.position = action_row[6:9].copy()
-        targets.pelvis.orientation = action_row[9:18].reshape(3, 3).copy()
-        targets.pelvis.linear_velocity = action_row[18:21].copy()
-        targets.pelvis.angular_velocity = action_row[21:24].copy()
-        targets.torso.orientation = action_row[24:33].reshape(3, 3).copy()
-        targets.torso.angular_velocity = action_row[33:36].copy()
-        targets.right_foot.position = action_row[36:39].copy()
-        targets.right_foot.orientation = action_row[39:48].reshape(3, 3).copy()
-        targets.right_foot.linear_velocity = action_row[48:51].copy()
-        targets.right_foot.angular_velocity = action_row[51:54].copy()
-        targets.left_foot.position = action_row[54:57].copy()
-        targets.left_foot.orientation = action_row[57:66].reshape(3, 3).copy()
-        targets.left_foot.linear_velocity = action_row[66:69].copy()
-        targets.left_foot.angular_velocity = action_row[69:72].copy()
-    else:
-        targets.pelvis.orientation = action_row[6:15].reshape(3, 3).copy()
-        targets.pelvis.angular_velocity = action_row[15:18].copy()
-        targets.torso.orientation = action_row[18:27].reshape(3, 3).copy()
-        targets.torso.angular_velocity = action_row[27:30].copy()
-        targets.right_foot.position = action_row[30:33].copy()
-        targets.right_foot.orientation = action_row[33:42].reshape(3, 3).copy()
-        targets.right_foot.linear_velocity = action_row[42:45].copy()
-        targets.right_foot.angular_velocity = action_row[45:48].copy()
-        targets.left_foot.position = action_row[48:51].copy()
-        targets.left_foot.orientation = action_row[51:60].reshape(3, 3).copy()
-        targets.left_foot.linear_velocity = action_row[60:63].copy()
-        targets.left_foot.angular_velocity = action_row[63:66].copy()
+    targets.pelvis.position = pelvis_pose[:3, 3] + action_row[6:9]
+    targets.pelvis.orientation = pelvis_pose[:3, :3] @ axis_angle_to_matrix(action_row[9:12])
+    targets.pelvis.linear_velocity = action_row[12:15].copy()
+    targets.pelvis.angular_velocity = action_row[15:18].copy()
+    targets.torso.orientation = torso_pose[:3, :3] @ axis_angle_to_matrix(action_row[18:21])
+    targets.torso.angular_velocity = action_row[21:24].copy()
+    targets.right_foot.position = action_row[24:27].copy()
+    targets.right_foot.orientation = action_row[27:36].reshape(3, 3).copy()
+    targets.right_foot.linear_velocity = action_row[36:39].copy()
+    targets.right_foot.angular_velocity = action_row[39:42].copy()
+    targets.left_foot.position = action_row[42:45].copy()
+    targets.left_foot.orientation = action_row[45:54].reshape(3, 3).copy()
+    targets.left_foot.linear_velocity = action_row[54:57].copy()
+    targets.left_foot.angular_velocity = action_row[57:60].copy()
     return targets
 
 def _single_wbc_state(term) -> int:
@@ -617,10 +612,14 @@ def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actio
     term._last_wbc_root_state[:1] = root_states[:1]
     term._last_wbc_dof_pos[:1] = dof_pos[:1]
 
-    right_contact_points = term._as_numpy_2d(env.simulator.right_foot_contact_position, "right_contact_points")
-    left_contact_points = term._as_numpy_2d(env.simulator.left_foot_contact_position, "left_contact_points")
-    right_contact_bases = term._contact_bases_as_numpy(env.simulator.right_foot_contact_basis, "right_contact_bases")
-    left_contact_bases = term._contact_bases_as_numpy(env.simulator.left_foot_contact_basis, "left_contact_bases")
+    contact_arrays = getattr(term, "_stance_support_contact_arrays", None)
+    if callable(contact_arrays):
+        right_contact_points, left_contact_points, right_contact_bases, left_contact_bases = contact_arrays()
+    else:
+        right_contact_points = term._as_numpy_2d(env.simulator.right_foot_contact_position, "right_contact_points")
+        left_contact_points = term._as_numpy_2d(env.simulator.left_foot_contact_position, "left_contact_points")
+        right_contact_bases = term._contact_bases_as_numpy(env.simulator.right_foot_contact_basis, "right_contact_bases")
+        left_contact_bases = term._contact_bases_as_numpy(env.simulator.left_foot_contact_basis, "left_contact_bases")
     right_grfs = term._batched_local_foot_ground_reaction_wrenches("right")
     left_grfs = term._batched_local_foot_ground_reaction_wrenches("left")
     right_in_contact = term._batched_foot_contact_in_contact("right", right_grfs)
@@ -686,7 +685,7 @@ def _compute_single_wbc_torques(env, term, actions: torch.Tensor, *, scale_actio
         bool(left_in_contact[0]),
         in_transition
     )
-    targets = _wbc_targets_from_action(term._wbc_module, compute_action_batch[0])
+    targets = _wbc_targets_from_action(term._wbc_module, engine, compute_action_batch[0])
     result = engine.compute(next_state, targets, True, True, False, float(env.simulator.time()), transition_start_time)
     if isinstance(result, tuple):
         torque_wbc, output_state = result
@@ -726,14 +725,44 @@ def _wbc_action_batch_dim(term) -> int | None:
     return int(action_batch.shape[1])
 
 def _assert_wbc_action_batch_dim_supported(action_batch) -> None:
-    if action_batch.shape[1] not in (66, 72):
-        raise RuntimeError(f"Expected a 66D or 72D batched WBC action row, got shape={action_batch.shape}.")
+    if action_batch.shape[1] != 72:
+        raise RuntimeError(f"Expected a 72D batched WBC action row, got shape={action_batch.shape}.")
 
 def _expected_task_actions(actions: torch.Tensor, term, *, scale_actions: bool) -> torch.Tensor:
-    if not scale_actions:
-        return actions
     action_scales = term.action_scales.to(device=actions.device, dtype=actions.dtype)
-    return actions * action_scales
+    if scale_actions:
+        return actions * action_scales
+    policy_actions = _task_actions_to_policy(actions, term)
+    return policy_actions * action_scales
+
+def _expected_wbc_velocity_actions(
+    env,
+    term,
+    expected_task_actions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    com_vel = expected_task_actions[:, 0:3].clone()
+    pelvis_ang_vel = expected_task_actions[:, 3:6].clone()
+    if not bool(getattr(term, "_use_command_as_pelvis_velocity_action", False)):
+        return com_vel, pelvis_ang_vel
+
+    command_manager = getattr(env, "command_manager", None)
+    commands = getattr(command_manager, "commands", None)
+    if commands is None:
+        return com_vel, pelvis_ang_vel
+
+    command_tensor = torch.as_tensor(commands, device=expected_task_actions.device, dtype=expected_task_actions.dtype)
+    if command_tensor.ndim != 2 or command_tensor.shape[0] < expected_task_actions.shape[0] or command_tensor.shape[1] < 3:
+        return com_vel, pelvis_ang_vel
+
+    command_tensor = command_tensor[: expected_task_actions.shape[0], :3]
+    if not bool(torch.isfinite(command_tensor).all()):
+        return com_vel, pelvis_ang_vel
+
+    com_vel.zero_()
+    com_vel[:, 0:2] = command_tensor[:, 0:2]
+    pelvis_ang_vel.zero_()
+    pelvis_ang_vel[:, 2] = command_tensor[:, 2]
+    return com_vel, pelvis_ang_vel
 
 def _assert_wbc_action_layout_values(env, term, expected_task_actions: torch.Tensor) -> None:
     action_batch = getattr(term, "_last_wbc_action_batch", None)
@@ -742,7 +771,6 @@ def _assert_wbc_action_layout_values(env, term, expected_task_actions: torch.Ten
     _assert_wbc_action_batch_dim_supported(action_batch)
 
     action_batch_t = torch.as_tensor(action_batch, device=expected_task_actions.device, dtype=expected_task_actions.dtype)
-    is_72d = action_batch_t.shape[1] == 72
 
     for env_idx in range(action_batch_t.shape[0]):
         com_target_pos = _integrated_target_value(term, "_wbc_integrated_com_pos", env_idx)
@@ -757,107 +785,72 @@ def _assert_wbc_action_layout_values(env, term, expected_task_actions: torch.Ten
             com_target_pos,
             expected_task_actions.device,
         )
-        if is_72d:
-            _assert_target_position_slice(
-                action_batch_t,
-                env_idx,
-                "pelvis_pos",
-                slice(6, 9),
-                pelvis_target_pos,
-                expected_task_actions.device,
-            )
-            _assert_target_rotation_slice(
-                action_batch_t,
-                env_idx,
-                "pelvis_ori",
-                slice(9, 18),
-                pelvis_target_rot,
-                expected_task_actions.device,
-            )
-            _assert_target_rotation_slice(
-                action_batch_t,
-                env_idx,
-                "torso_ori",
-                slice(24, 33),
-                torso_target_rot,
-                expected_task_actions.device,
-            )
-            _assert_foot_target_slices_valid(
-                action_batch_t,
-                env_idx,
-                "right",
-                slice(36, 39),
-                slice(39, 48),
-                slice(48, 54),
-            )
-            _assert_foot_target_slices_valid(
-                action_batch_t,
-                env_idx,
-                "left",
-                slice(54, 57),
-                slice(57, 66),
-                slice(66, 72),
-            )
-        else:
-            _assert_target_rotation_slice(
-                action_batch_t,
-                env_idx,
-                "pelvis_ori",
-                slice(6, 15),
-                pelvis_target_rot,
-                expected_task_actions.device,
-            )
-            _assert_target_rotation_slice(
-                action_batch_t,
-                env_idx,
-                "torso_ori",
-                slice(18, 27),
-                torso_target_rot,
-                expected_task_actions.device,
-            )
-            _assert_foot_target_slices_valid(
-                action_batch_t,
-                env_idx,
-                "right",
-                slice(30, 33),
-                slice(33, 42),
-                slice(42, 48),
-            )
-            _assert_foot_target_slices_valid(
-                action_batch_t,
-                env_idx,
-                "left",
-                slice(48, 51),
-                slice(51, 60),
-                slice(60, 66),
-            )
+        _assert_target_position_slice(
+            action_batch_t,
+            env_idx,
+            "pelvis_pos",
+            slice(6, 9),
+            pelvis_target_pos,
+            expected_task_actions.device,
+        )
+        pelvis_target_axis_angle = (
+            None if pelvis_target_rot is None else matrix_to_axis_angle(np.asarray(pelvis_target_rot, dtype=np.float64))
+        )
+        torso_target_axis_angle = (
+            None if torso_target_rot is None else matrix_to_axis_angle(np.asarray(torso_target_rot, dtype=np.float64))
+        )
+        _assert_target_position_slice(
+            action_batch_t,
+            env_idx,
+            "pelvis_rel_ori",
+            slice(9, 12),
+            pelvis_target_axis_angle,
+            expected_task_actions.device,
+        )
+        _assert_target_position_slice(
+            action_batch_t,
+            env_idx,
+            "torso_rel_ori",
+            slice(18, 21),
+            torso_target_axis_angle,
+            expected_task_actions.device,
+        )
+        _assert_foot_target_slices_valid(
+            action_batch_t,
+            env_idx,
+            "right",
+            slice(24, 27),
+            slice(27, 36),
+            slice(36, 42),
+        )
+        _assert_foot_target_slices_valid(
+            action_batch_t,
+            env_idx,
+            "left",
+            slice(42, 45),
+            slice(45, 54),
+            slice(54, 60),
+        )
 
-    if is_72d:
-        expected_pairs = (
-            ("com_lin_vel", slice(3, 6), expected_task_actions[:, 6:9]),
-            ("pelvis_lin_vel", slice(18, 21), expected_task_actions[:, 0:3]),
-            ("pelvis_ang_vel", slice(21, 24), expected_task_actions[:, 3:6]),
-            ("torso_ang_vel", slice(33, 36), expected_task_actions[:, 3:6]),
-        )
-    else:
-        zero_ang_vel = torch.zeros(action_batch_t.shape[0], 3, device=expected_task_actions.device, dtype=expected_task_actions.dtype)
-        expected_com_vel = zero_ang_vel.clone()
-        expected_pelvis_ang_vel = zero_ang_vel.clone()
-        if expected_task_actions.shape[1] >= 3:
-            expected_com_vel[:, 0:2] = expected_task_actions[:, 0:2]
-            expected_pelvis_ang_vel[:, 2] = expected_task_actions[:, 2]
-        expected_pairs = (
-            ("com_lin_vel", slice(3, 6), expected_com_vel),
-            ("pelvis_ang_vel", slice(15, 18), expected_pelvis_ang_vel),
-            ("torso_ang_vel", slice(27, 30), expected_pelvis_ang_vel),
-        )
+    expected_com_vel, expected_pelvis_ang_vel = _expected_wbc_velocity_actions(
+        env,
+        term,
+        expected_task_actions,
+    )
+    expected_pairs = (
+        ("com_lin_vel", slice(3, 6), expected_com_vel),
+        ("pelvis_lin_vel", slice(12, 15), expected_com_vel),
+        ("pelvis_ang_vel", slice(15, 18), expected_pelvis_ang_vel),
+        ("torso_ang_vel", slice(21, 24), expected_pelvis_ang_vel),
+    )
 
     for label, wbc_slice, expected in expected_pairs:
         actual = action_batch_t[:, wbc_slice]
         if not bool(torch.allclose(actual, expected, atol=1.0e-6, rtol=1.0e-5)):
             raise RuntimeError(
                 f"WBC action {label} slice mismatch: actual={_format_tensor_row(actual[0])} "
-                f"expected={_format_tensor_row(expected[0])}."
+                f"expected={_format_tensor_row(expected[0])} "
+                f"use_command_as_pelvis_velocity_action={getattr(term, '_use_command_as_pelvis_velocity_action', None)}."
             )
 
 def _assert_required_wbc_bindings(term) -> None:
@@ -869,14 +862,17 @@ def _assert_required_wbc_bindings(term) -> None:
         raise RuntimeError("humanoid_wbc does not expose SwingFoot.")
     if not hasattr(swing_foot, "computeLandingFootstepPoseFromCapturePointBatch"):
         raise RuntimeError("humanoid_wbc.SwingFoot is missing computeLandingFootstepPoseFromCapturePointBatch.")
-    if not hasattr(swing_foot(), "resolveTrajectoryFromCurrentStateToPose"):
-        raise RuntimeError("humanoid_wbc.SwingFoot is missing resolveTrajectoryFromCurrentStateToPose.")
+    swing_foot_instance = swing_foot()
+    if not hasattr(swing_foot_instance, "resolveTrajectoryFromCurrentState"):
+        raise RuntimeError("humanoid_wbc.SwingFoot is missing resolveTrajectoryFromCurrentState.")
+    if not hasattr(swing_foot_instance, "setMidpointHeight"):
+        raise RuntimeError("humanoid_wbc.SwingFoot is missing setMidpointHeight.")
 
-def _assert_action_layout_12d(env) -> None:
-    if env.action_manager.total_action_dim != 12:
+def _assert_action_layout_9d(env) -> None:
+    if env.action_manager.total_action_dim != 9:
         raise RuntimeError(
-            "g1_wbc_torque_control expects the 12D WBC action setup "
-            "[pelvis_lin_vel(3), pelvis_ang_vel(3), com_vel(3), landing_foot_delta_xyyaw(3)], "
+            "g1_wbc_torque_control expects the 9D WBC action setup "
+            "[com_vel(3), pelvis_ang_vel(3), landing_foot_delta_xyyaw(3)], "
             f"got action_dim={env.action_manager.total_action_dim}."
         )
 
@@ -1056,11 +1052,11 @@ def main() -> int:
         "--action-amplitude",
         type=float,
         nargs="+",
-        default=[0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.0, 0.0, 0.0, 0, 0, 0],
+        default=[0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.0, 0.0, 0.0],
         metavar="A",
         help=(
-            "Sinusoidal action amplitude. Pass one value for all 12 action dimensions, or 12 values for "
-            "[pelvis_lin_vel, pelvis_ang_vel, com_vel, landing_foot_delta_xyyaw]."
+            "Sinusoidal action amplitude. Pass one value for all 9 action dimensions, or 9 values for "
+            "[com_vel, pelvis_ang_vel, landing_foot_delta_xyyaw]."
         ),
     )
     parser.add_argument(
@@ -1069,7 +1065,7 @@ def main() -> int:
         nargs="+",
         default=[1.0],
         metavar="HZ",
-        help="Sinusoidal action frequency in Hz. Pass one value for all dimensions, or 12 values.",
+        help="Sinusoidal action frequency in Hz. Pass one value for all dimensions, or 9 values.",
     )
     parser.add_argument(
         "--action-phase",
@@ -1077,7 +1073,7 @@ def main() -> int:
         nargs="+",
         default=[0.0],
         metavar="RAD",
-        help="Sinusoidal action phase in radians. Pass one value for all dimensions, or 12 values.",
+        help="Sinusoidal action phase in radians. Pass one value for all dimensions, or 9 values.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generated test actions.")
     parser.add_argument(
@@ -1146,7 +1142,7 @@ def main() -> int:
         _reset_without_physics_step(env)
         _zero_reset_velocities(env)
         term = env.action_manager.get_term("torque_control")
-        # _assert_action_layout_12d(env)
+        # _assert_action_layout_9d(env)
         # _assert_required_wbc_bindings(term)
 
         wbc_engine = getattr(term, "_wbc_debug_engine", term.wbc)
@@ -1263,7 +1259,7 @@ def main() -> int:
                 if not args.disable_com_visualization:
                     current_com = _current_com_position(wbc_engine, device)
                     desired_com = current_com + torch.cat(
-                        [actions[0, 6:8] * float(env.dt), torch.zeros(1, device=device, dtype=torch.float32)]
+                        [actions[0, 0:2] * float(env.dt), torch.zeros(1, device=device, dtype=torch.float32)]
                     )
                     _draw_com_markers(env, current_com, desired_com, args.com_marker_radius)
 

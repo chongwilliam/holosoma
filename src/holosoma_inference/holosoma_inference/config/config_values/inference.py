@@ -10,9 +10,8 @@ from holosoma_inference.config.config_types.inference import InferenceConfig
 from holosoma_inference.config.config_values import observation, robot, task
 
 g1_loco_task_space_action_scale = (
-    0.1, 0.1, 0.05,  # pelvis linear velocity residual: vx, vy, vz
-    0.001, 0.001, 0.001,  # pelvis angular velocity residual: wx, wy, wz
-    0.1, 0.1, 0.05,  # COM velocity residual: vx, vy, vz
+    0.0, 0.0, 0.0,  # COM velocity residual: vx, vy, vz
+    0.0, 0.0, 0.0,  # pelvis angular velocity residual: wx, wy, wz
     0.1, 0.1, 0.05,  # landing foot residual: dx, dy, dyaw
 )
 

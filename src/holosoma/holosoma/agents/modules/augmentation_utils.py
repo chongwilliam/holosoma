@@ -4,11 +4,10 @@ from typing import Any, Dict, List, Sequence
 
 import torch
 
-WBC_TASK_SPACE_ACTION_DIM = 12
-WBC_PELVIS_LIN_VEL_SLICE = slice(0, 3)
+WBC_TASK_SPACE_ACTION_DIM = 9
+WBC_COM_VEL_SLICE = slice(0, 3)
 WBC_PELVIS_ANG_VEL_SLICE = slice(3, 6)
-WBC_COM_VEL_SLICE = slice(6, 9)
-WBC_LANDING_DELTA_SLICE = slice(9, 12)
+WBC_LANDING_DELTA_SLICE = slice(6, 9)
 
 
 class SymmetryUtils:
@@ -327,7 +326,7 @@ class SymmetryUtils:
         return action[..., self.joint_index_map] * self.sign_flip_mask
 
     def _mirror_wbc_task_space_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Mirror WBC actions: [pelvis_lin_vel, pelvis_ang_vel, com_vel, landing_foot_delta_xyyaw]."""
+        """Mirror WBC actions: [com_vel, pelvis_ang_vel, landing_foot_delta_xyyaw]."""
         if action.shape[-1] != WBC_TASK_SPACE_ACTION_DIM:
             raise ValueError(
                 f"Unsupported WBC task-space action dimension: got {action.shape[-1]}, "
@@ -335,9 +334,8 @@ class SymmetryUtils:
             )
 
         mirrored = action.clone()
-        mirrored[..., WBC_PELVIS_LIN_VEL_SLICE] = self._mirror_wbc_position(action[..., WBC_PELVIS_LIN_VEL_SLICE])
-        mirrored[..., WBC_PELVIS_ANG_VEL_SLICE] = self._mirror_wbc_axis_angle(action[..., WBC_PELVIS_ANG_VEL_SLICE])
         mirrored[..., WBC_COM_VEL_SLICE] = self._mirror_wbc_position(action[..., WBC_COM_VEL_SLICE])
+        mirrored[..., WBC_PELVIS_ANG_VEL_SLICE] = self._mirror_wbc_axis_angle(action[..., WBC_PELVIS_ANG_VEL_SLICE])
         mirrored[..., WBC_LANDING_DELTA_SLICE] = self._mirror_wbc_landing_delta(action[..., WBC_LANDING_DELTA_SLICE])
         return mirrored
 

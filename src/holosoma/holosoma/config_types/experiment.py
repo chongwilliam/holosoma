@@ -86,6 +86,21 @@ class TrainingConfig:
     export_onnx: bool = True
     """Export policy as ONNX model."""
 
+    hold_starting_dual_stance: bool = False
+    """Debug mode: reset the environment and hold the starting pose with PD torques instead of training."""
+
+    hold_starting_dual_stance_duration_s: float = 10.0
+    """Duration in seconds for hold_starting_dual_stance mode."""
+
+    hold_starting_dual_stance_print_every: int = 20
+    """Print contact/root summaries every N physics steps in hold_starting_dual_stance mode."""
+
+    dual_stance_training_warmup: bool = True
+    """Before learning starts, settle into dual stance with PD, then hold with WBC before enabling policy actions."""
+
+    dual_stance_training_warmup_duration_s: float = 1.0
+    """WBC dual-stance hold duration before releasing the policy/gait clock for training."""
+
 
 @dataclass(frozen=True)
 class EvalOverridesConfig:

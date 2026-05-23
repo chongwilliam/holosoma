@@ -256,16 +256,16 @@ def test_mirror_wbc_task_space_action(mock_env_with_history):
 
     actions = torch.tensor(
         [
-            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-            [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -10.0, -11.0, -12.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0],
         ]
     )
 
     mirrored = symmetry_utils.mirror_action_xz_plane(actions)
     expected = torch.tensor(
         [
-            [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 10.0, -11.0, -12.0],
-            [-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0, -9.0, -10.0, 11.0, 12.0],
+            [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, -9.0],
+            [-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0, 9.0],
         ]
     )
 
@@ -273,12 +273,12 @@ def test_mirror_wbc_task_space_action(mock_env_with_history):
 
 
 def test_mirror_wbc_task_space_action_observation(mock_env_with_history):
-    """Test mirroring for previous-action observations using the 12D WBC layout."""
+    """Test mirroring for previous-action observations using the 9D WBC layout."""
     symmetry_utils = SymmetryUtils(mock_env_with_history)
 
-    actions = torch.tensor([[0.5, -0.25, 1.25, 0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8, 0.9]])
+    actions = torch.tensor([[0.5, -0.25, 1.25, 0.1, -0.2, 0.3, 0.4, -0.5, 0.6]])
     mirrored = symmetry_utils.mirror_obs_actions(actions)
-    expected = torch.tensor([[0.5, 0.25, 1.25, -0.1, -0.2, -0.3, 0.4, 0.5, 0.6, 0.7, 0.8, -0.9]])
+    expected = torch.tensor([[0.5, 0.25, 1.25, -0.1, -0.2, -0.3, 0.4, 0.5, -0.6]])
 
     assert torch.allclose(mirrored, expected)
 
